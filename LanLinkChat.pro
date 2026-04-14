@@ -11,7 +11,8 @@ SOURCES += \
     src/network/peerconnection.cpp \
     src/network/peermanager.cpp \
     src/network/protocol.cpp \
-    src/ui/mainwindow.cpp
+    src/ui/mainwindow.cpp \
+    src/ui/videoframewidget.cpp
 
 HEADERS += \
     src/model/chattypes.h \
@@ -20,7 +21,8 @@ HEADERS += \
     src/network/peerconnection.h \
     src/network/peermanager.h \
     src/network/protocol.h \
-    src/ui/mainwindow.h
+    src/ui/mainwindow.h \
+    src/ui/videoframewidget.h
 
 INCLUDEPATH += $$PWD/src
 

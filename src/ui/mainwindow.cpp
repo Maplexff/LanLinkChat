@@ -15,6 +15,8 @@
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QFormLayout>
+#include <QComboBox>
+#include <QCheckBox>
 #include <QHBoxLayout>
 #include <QInputDialog>
 #include <QLabel>
@@ -25,7 +27,6 @@
 #include <QMessageBox>
 #include <QIODevice>
 #include <QPlainTextEdit>
-#include <QPixmap>
 #include <QPushButton>
 #include <QSignalBlocker>
 #include <QSettings>
@@ -33,13 +34,17 @@
 #include <QStatusBar>
 #include <QTabWidget>
 #include <QTextOption>
+#include <QTimer>
 #include <QVBoxLayout>
 #include <QVideoFrame>
 #include <QVideoFrameFormat>
 #include <QVideoSink>
 #include <QWidget>
 
+#include <limits>
+
 #include "network/peermanager.h"
+#include "ui/videoframewidget.h"
 
 namespace {
 
@@ -58,6 +63,72 @@ QString timestampLabel(const QDateTime &timestamp)
     return timestamp.toString(QStringLiteral("HH:mm:ss"));
 }
 
+int localVideoSendIntervalMs()
+{
+#ifdef Q_OS_LINUX
+    return 150;
+#else
+    return 100;
+#endif
+}
+
+int scoreCameraFormat(const QCameraFormat &format)
+{
+    if (format.pixelFormat() == QVideoFrameFormat::Format_Invalid) {
+        return std::numeric_limits<int>::min();
+    }
+
+    int score = 0;
+    switch (format.pixelFormat()) {
+    case QVideoFrameFormat::Format_YUYV:
+    case QVideoFrameFormat::Format_UYVY:
+        score += 2000;
+        break;
+    case QVideoFrameFormat::Format_NV12:
+    case QVideoFrameFormat::Format_NV21:
+    case QVideoFrameFormat::Format_YUV420P:
+    case QVideoFrameFormat::Format_YV12:
+        score += 1500;
+        break;
+    case QVideoFrameFormat::Format_Jpeg:
+        score += 500;
+        break;
+    default:
+        score += 800;
+        break;
+    }
+
+    const QSize resolution = format.resolution();
+    score -= qAbs(resolution.width() - 640);
+    score -= qAbs(resolution.height() - 360);
+
+    if (format.maxFrameRate() >= 30.0) {
+        score += 300;
+    }
+
+    return score;
+}
+
+QCameraFormat preferredCameraFormat(const QCameraDevice &device)
+{
+    const QList<QCameraFormat> formats = device.videoFormats();
+    if (formats.isEmpty()) {
+        return {};
+    }
+
+    QCameraFormat best = formats.constFirst();
+    int bestScore = scoreCameraFormat(best);
+    for (const QCameraFormat &candidate : formats) {
+        const int candidateScore = scoreCameraFormat(candidate);
+        if (candidateScore > bestScore) {
+            best = candidate;
+            bestScore = candidateScore;
+        }
+    }
+
+    return best;
+}
+
 QAudioFormat formatFromWire(int sampleRate, int channelCount, int sampleFormat)
 {
     QAudioFormat format;
@@ -72,6 +143,23 @@ int clampColor(int value)
     return qBound(0, value, 255);
 }
 
+enum class PackedYuv422Order {
+    YUYV,
+    UYVY,
+    YVYU,
+    VYUY
+};
+
+enum VideoDecodeMode {
+    VideoDecodeAuto = 0,
+    VideoDecodeYUYV,
+    VideoDecodeUYVY,
+    VideoDecodeYVYU,
+    VideoDecodeVYUY
+};
+
+int g_videoDecodeMode = VideoDecodeAuto;
+
 QRgb yuvToRgb(int yValue, int uValue, int vValue)
 {
     const int c = qMax(0, yValue - 16);
@@ -83,7 +171,7 @@ QRgb yuvToRgb(int yValue, int uValue, int vValue)
     return qRgb(r, g, b);
 }
 
-QImage convertPackedYuv422FrameToImage(const QVideoFrame &frame, bool yuyvLayout)
+QImage convertPackedYuv422FrameToImage(const QVideoFrame &frame, PackedYuv422Order order)
 {
     QVideoFrame mappedFrame(frame);
     if (!mappedFrame.map(QVideoFrame::ReadOnly)) {
@@ -115,10 +203,37 @@ QImage convertPackedYuv422FrameToImage(const QVideoFrame &frame, bool yuyvLayout
 
         for (int x = 0; x + 1 < size.width(); x += 2) {
             const int offset = x * 2;
-            const int y0 = yuyvLayout ? line[offset + 0] : line[offset + 1];
-            const int u = yuyvLayout ? line[offset + 1] : line[offset + 0];
-            const int y1 = yuyvLayout ? line[offset + 2] : line[offset + 3];
-            const int v = yuyvLayout ? line[offset + 3] : line[offset + 2];
+            int y0 = 0;
+            int y1 = 0;
+            int u = 128;
+            int v = 128;
+
+            switch (order) {
+            case PackedYuv422Order::YUYV:
+                y0 = line[offset + 0];
+                u = line[offset + 1];
+                y1 = line[offset + 2];
+                v = line[offset + 3];
+                break;
+            case PackedYuv422Order::UYVY:
+                u = line[offset + 0];
+                y0 = line[offset + 1];
+                v = line[offset + 2];
+                y1 = line[offset + 3];
+                break;
+            case PackedYuv422Order::YVYU:
+                y0 = line[offset + 0];
+                v = line[offset + 1];
+                y1 = line[offset + 2];
+                u = line[offset + 3];
+                break;
+            case PackedYuv422Order::VYUY:
+                v = line[offset + 0];
+                y0 = line[offset + 1];
+                u = line[offset + 2];
+                y1 = line[offset + 3];
+                break;
+            }
 
             dest[x] = yuvToRgb(y0, u, v);
             dest[x + 1] = yuvToRgb(y1, u, v);
@@ -127,6 +242,55 @@ QImage convertPackedYuv422FrameToImage(const QVideoFrame &frame, bool yuyvLayout
 
     mappedFrame.unmap();
     return image;
+}
+
+qint64 imageDifferenceScore(const QImage &candidate, const QImage &reference)
+{
+    if (candidate.isNull() || reference.isNull()) {
+        return std::numeric_limits<qint64>::max();
+    }
+
+    const QSize compareSize(80, 45);
+    const QImage left = candidate.scaled(compareSize, Qt::IgnoreAspectRatio, Qt::FastTransformation)
+                            .convertToFormat(QImage::Format_RGB32);
+    const QImage right = reference.scaled(compareSize, Qt::IgnoreAspectRatio, Qt::FastTransformation)
+                             .convertToFormat(QImage::Format_RGB32);
+
+    qint64 score = 0;
+    for (int y = 0; y < compareSize.height(); ++y) {
+        const QRgb *leftLine = reinterpret_cast<const QRgb *>(left.constScanLine(y));
+        const QRgb *rightLine = reinterpret_cast<const QRgb *>(right.constScanLine(y));
+        for (int x = 0; x < compareSize.width(); ++x) {
+            score += qAbs(qRed(leftLine[x]) - qRed(rightLine[x]));
+            score += qAbs(qGreen(leftLine[x]) - qGreen(rightLine[x]));
+            score += qAbs(qBlue(leftLine[x]) - qBlue(rightLine[x]));
+        }
+    }
+
+    return score;
+}
+
+QImage bestPackedYuv422TransportImage(const QVideoFrame &frame, const QImage &referenceImage)
+{
+    const QList<PackedYuv422Order> candidates = {
+        PackedYuv422Order::YUYV,
+        PackedYuv422Order::UYVY,
+        PackedYuv422Order::YVYU,
+        PackedYuv422Order::VYUY
+    };
+
+    QImage bestImage;
+    qint64 bestScore = std::numeric_limits<qint64>::max();
+    for (PackedYuv422Order candidate : candidates) {
+        const QImage image = convertPackedYuv422FrameToImage(frame, candidate).copy();
+        const qint64 score = imageDifferenceScore(image, referenceImage);
+        if (score < bestScore) {
+            bestScore = score;
+            bestImage = image;
+        }
+    }
+
+    return bestImage;
 }
 
 QImage convertPlanarYuv420FrameToImage(const QVideoFrame &frame, bool nv21Layout, bool yv12Layout)
@@ -211,26 +375,80 @@ QImage convertPlanarYuv420FrameToImage(const QVideoFrame &frame, bool nv21Layout
 
 QImage frameToDisplayImage(const QVideoFrame &frame)
 {
+    if (frame.pixelFormat() == QVideoFrameFormat::Format_YUYV || frame.pixelFormat() == QVideoFrameFormat::Format_UYVY) {
+        switch (g_videoDecodeMode) {
+        case VideoDecodeYUYV:
+            return convertPackedYuv422FrameToImage(frame, PackedYuv422Order::YUYV).copy();
+        case VideoDecodeUYVY:
+            return convertPackedYuv422FrameToImage(frame, PackedYuv422Order::UYVY).copy();
+        case VideoDecodeYVYU:
+            return convertPackedYuv422FrameToImage(frame, PackedYuv422Order::YVYU).copy();
+        case VideoDecodeVYUY:
+            return convertPackedYuv422FrameToImage(frame, PackedYuv422Order::VYUY).copy();
+        default:
+            break;
+        }
+    }
+
     if (const QImage directImage = frame.toImage(); !directImage.isNull()) {
-        return directImage;
+        const QImage rgbImage = directImage.convertToFormat(QImage::Format_RGB32);
+        return rgbImage.isNull() ? QImage() : rgbImage.copy();
     }
 
     switch (frame.pixelFormat()) {
     case QVideoFrameFormat::Format_YUYV:
-        return convertPackedYuv422FrameToImage(frame, true);
+        return convertPackedYuv422FrameToImage(frame, PackedYuv422Order::YUYV).copy();
     case QVideoFrameFormat::Format_UYVY:
-        return convertPackedYuv422FrameToImage(frame, false);
+        return convertPackedYuv422FrameToImage(frame, PackedYuv422Order::UYVY).copy();
     case QVideoFrameFormat::Format_NV12:
-        return convertPlanarYuv420FrameToImage(frame, false, false);
+        return convertPlanarYuv420FrameToImage(frame, false, false).copy();
     case QVideoFrameFormat::Format_NV21:
-        return convertPlanarYuv420FrameToImage(frame, true, false);
+        return convertPlanarYuv420FrameToImage(frame, true, false).copy();
     case QVideoFrameFormat::Format_YUV420P:
-        return convertPlanarYuv420FrameToImage(frame, false, false);
+        return convertPlanarYuv420FrameToImage(frame, false, false).copy();
     case QVideoFrameFormat::Format_YV12:
-        return convertPlanarYuv420FrameToImage(frame, false, true);
+        return convertPlanarYuv420FrameToImage(frame, false, true).copy();
     default:
         return {};
     }
+}
+
+QImage frameToTransportImage(const QVideoFrame &frame, const QImage &displayImage)
+{
+#ifdef Q_OS_LINUX
+    switch (frame.pixelFormat()) {
+    case QVideoFrameFormat::Format_YUYV:
+    case QVideoFrameFormat::Format_UYVY:
+        switch (g_videoDecodeMode) {
+        case VideoDecodeYUYV:
+            return convertPackedYuv422FrameToImage(frame, PackedYuv422Order::YUYV).copy();
+        case VideoDecodeUYVY:
+            return convertPackedYuv422FrameToImage(frame, PackedYuv422Order::UYVY).copy();
+        case VideoDecodeYVYU:
+            return convertPackedYuv422FrameToImage(frame, PackedYuv422Order::YVYU).copy();
+        case VideoDecodeVYUY:
+            return convertPackedYuv422FrameToImage(frame, PackedYuv422Order::VYUY).copy();
+        default:
+            break;
+        }
+        if (!displayImage.isNull()) {
+            return bestPackedYuv422TransportImage(frame, displayImage);
+        }
+        break;
+    case QVideoFrameFormat::Format_NV12:
+        return convertPlanarYuv420FrameToImage(frame, false, false).copy();
+    case QVideoFrameFormat::Format_NV21:
+        return convertPlanarYuv420FrameToImage(frame, true, false).copy();
+    case QVideoFrameFormat::Format_YUV420P:
+        return convertPlanarYuv420FrameToImage(frame, false, false).copy();
+    case QVideoFrameFormat::Format_YV12:
+        return convertPlanarYuv420FrameToImage(frame, false, true).copy();
+    default:
+        break;
+    }
+#endif
+
+    return frameToDisplayImage(frame);
 }
 
 }
@@ -239,6 +457,7 @@ MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)
     , m_manager(new PeerManager(this))
     , m_videoSink(new QVideoSink(this))
+    , m_videoRefreshTimer(new QTimer(this))
 {
     buildUi();
 
@@ -246,6 +465,31 @@ MainWindow::MainWindow(QWidget *parent)
     const QString savedName = settings.value(QStringLiteral("displayName"), m_manager->displayName()).toString();
     m_nameEdit->setText(savedName);
     m_manager->setDisplayName(savedName);
+    populateCameraDevices();
+
+    const QByteArray savedCameraId = settings.value(QStringLiteral("cameraDeviceId")).toByteArray();
+    if (m_cameraCombo) {
+        for (int index = 0; index < m_cameraCombo->count(); ++index) {
+            if (m_cameraCombo->itemData(index).toByteArray() == savedCameraId) {
+                m_cameraCombo->setCurrentIndex(index);
+                break;
+            }
+        }
+    }
+    if (m_receiveOnlyCheck) {
+        m_receiveOnlyCheck->setChecked(settings.value(QStringLiteral("receiveOnlyWithoutCamera"), true).toBool());
+    }
+    if (m_receiveRemoteVideoOnlyCheck) {
+        m_receiveRemoteVideoOnlyCheck->setChecked(settings.value(QStringLiteral("receiveRemoteVideoOnly"), false).toBool());
+    }
+    if (m_decodeModeCombo) {
+        const int decodeMode = settings.value(QStringLiteral("videoDecodeMode"), VideoDecodeAuto).toInt();
+        const int index = m_decodeModeCombo->findData(decodeMode);
+        if (index >= 0) {
+            m_decodeModeCombo->setCurrentIndex(index);
+            g_videoDecodeMode = decodeMode;
+        }
+    }
 
     connect(m_manager, &PeerManager::peersChanged, this, &MainWindow::onPeersChanged);
     connect(m_manager, &PeerManager::groupsChanged, this, &MainWindow::onGroupsChanged);
@@ -259,6 +503,10 @@ MainWindow::MainWindow(QWidget *parent)
     connect(m_manager, &PeerManager::remoteVideoFrameReceived, this, &MainWindow::onRemoteVideoFrameReceived);
     connect(m_manager, &PeerManager::remoteAudioChunkReceived, this, &MainWindow::onRemoteAudioChunkReceived);
     connect(m_videoSink, &QVideoSink::videoFrameChanged, this, &MainWindow::processLocalFrame);
+    connect(m_videoRefreshTimer, &QTimer::timeout, this, &MainWindow::flushVideoFrames);
+
+    m_videoRefreshTimer->setInterval(66);
+    m_videoRefreshTimer->start();
 
     onPeersChanged(m_manager->peers());
     onGroupsChanged(m_manager->groups());
@@ -288,6 +536,70 @@ void MainWindow::applyDisplayName()
     QSettings settings;
     settings.setValue(QStringLiteral("displayName"), m_manager->displayName());
     statusBar()->showMessage(QStringLiteral("显示名已更新。"), 3000);
+}
+
+void MainWindow::applyCameraSelection()
+{
+    if (!m_cameraCombo) {
+        return;
+    }
+
+    QSettings settings;
+    settings.setValue(QStringLiteral("cameraDeviceId"), m_cameraCombo->currentData().toByteArray());
+
+    const QString cameraName = m_cameraCombo->currentText().trimmed();
+    if (m_camera) {
+        stopCamera();
+        if (!m_activeCallPeerId.isEmpty()) {
+            ensureCameraRunning();
+        }
+    }
+
+    statusBar()->showMessage(QStringLiteral("摄像头已切换为：%1").arg(cameraName.isEmpty() ? QStringLiteral("默认设备") : cameraName), 3000);
+}
+
+void MainWindow::applyVideoDecodeModeSelection()
+{
+    if (!m_decodeModeCombo) {
+        return;
+    }
+
+    const int decodeMode = m_decodeModeCombo->currentData().toInt();
+    g_videoDecodeMode = decodeMode;
+
+    QSettings settings;
+    settings.setValue(QStringLiteral("videoDecodeMode"), decodeMode);
+
+    m_pendingLocalFrame = QImage();
+    m_lastLocalFrame = QImage();
+    refreshVideoLabels();
+    statusBar()->showMessage(QStringLiteral("视频解码模式已更新。"), 3000);
+}
+
+void MainWindow::applyReceiveOnlySetting(bool enabled)
+{
+    QSettings settings;
+    settings.setValue(QStringLiteral("receiveOnlyWithoutCamera"), enabled);
+    statusBar()->showMessage(enabled
+                                 ? QStringLiteral("已开启无摄像头时仅接收模式。")
+                             : QStringLiteral("已关闭无摄像头时仅接收模式。"),
+                             3000);
+}
+
+void MainWindow::applyReceiveRemoteVideoOnlySetting(bool enabled)
+{
+    QSettings settings;
+    settings.setValue(QStringLiteral("receiveRemoteVideoOnly"), enabled);
+
+    if (enabled) {
+        stopCamera();
+    }
+
+    statusBar()->showMessage(enabled
+                                 ? QStringLiteral("已开启仅接收图像模式，本地不会发送视频。")
+                                 : QStringLiteral("已关闭仅接收图像模式。"),
+                             3000);
+    refreshConversationView();
 }
 
 void MainWindow::triggerPeerDiscovery()
@@ -397,7 +709,7 @@ void MainWindow::startVideoCall()
         return;
     }
 
-    if (!ensureCameraRunning()) {
+    if (!prepareCallCamera()) {
         return;
     }
     startAudioCapture();
@@ -407,7 +719,9 @@ void MainWindow::startVideoCall()
         m_contentTabs->setCurrentIndex(1);
     }
     if (m_callStatusLabel) {
-        m_callStatusLabel->setText(QStringLiteral("正在呼叫 %1").arg(peerName(peerId)));
+        m_callStatusLabel->setText(shouldSendLocalVideo()
+                                       ? QStringLiteral("正在呼叫 %1").arg(peerName(peerId))
+                                       : QStringLiteral("正在呼叫 %1（仅接收图像）").arg(peerName(peerId)));
     }
     statusBar()->showMessage(QStringLiteral("已向 %1 发起音视频请求。").arg(peerName(peerId)), 4000);
     updateActionState();
@@ -424,6 +738,8 @@ void MainWindow::endVideoCall()
     m_activeCallPeerId.clear();
     m_lastRemoteFrame = QImage();
     m_lastLocalFrame = QImage();
+    m_pendingRemoteFrame = QImage();
+    m_pendingLocalFrame = QImage();
     refreshVideoLabels();
     if (m_callStatusLabel) {
         m_callStatusLabel->setText(QStringLiteral("未在通话中"));
@@ -446,7 +762,9 @@ void MainWindow::refreshConversationView()
 
     if (m_callStatusLabel) {
         if (!m_activeCallPeerId.isEmpty()) {
-            m_callStatusLabel->setText(QStringLiteral("正在与 %1 音视频通话").arg(peerName(m_activeCallPeerId)));
+            m_callStatusLabel->setText(shouldSendLocalVideo()
+                                           ? QStringLiteral("正在与 %1 音视频通话").arg(peerName(m_activeCallPeerId))
+                                           : QStringLiteral("正在与 %1 通话（仅接收图像）").arg(peerName(m_activeCallPeerId)));
         } else if (!currentPeerId().isEmpty()) {
             m_callStatusLabel->setText(QStringLiteral("当前通话目标: %1").arg(peerName(currentPeerId())));
         } else {
@@ -546,7 +864,7 @@ void MainWindow::onCallInvitationReceived(const QString &peerId)
                                               QStringLiteral("音视频通话"),
                                               QStringLiteral("%1 邀请你开始音视频通话，是否接受？").arg(peerName(peerId)));
     if (result == QMessageBox::Yes) {
-        if (!ensureCameraRunning()) {
+        if (!prepareCallCamera()) {
             return;
         }
         startAudioCapture();
@@ -556,7 +874,9 @@ void MainWindow::onCallInvitationReceived(const QString &peerId)
             m_contentTabs->setCurrentIndex(1);
         }
         if (m_callStatusLabel) {
-            m_callStatusLabel->setText(QStringLiteral("正在与 %1 音视频通话").arg(peerName(peerId)));
+            m_callStatusLabel->setText(shouldSendLocalVideo()
+                                           ? QStringLiteral("正在与 %1 音视频通话").arg(peerName(peerId))
+                                           : QStringLiteral("正在与 %1 通话（仅接收图像）").arg(peerName(peerId)));
         }
         statusBar()->showMessage(QStringLiteral("已接受 %1 的音视频请求。").arg(peerName(peerId)), 4000);
         updateActionState();
@@ -568,7 +888,7 @@ void MainWindow::onCallAccepted(const QString &peerId)
     if (m_activeCallPeerId != peerId) {
         m_activeCallPeerId = peerId;
     }
-    if (!ensureCameraRunning()) {
+    if (!prepareCallCamera()) {
         return;
     }
     startAudioCapture();
@@ -576,7 +896,9 @@ void MainWindow::onCallAccepted(const QString &peerId)
         m_contentTabs->setCurrentIndex(1);
     }
     if (m_callStatusLabel) {
-        m_callStatusLabel->setText(QStringLiteral("正在与 %1 音视频通话").arg(peerName(peerId)));
+        m_callStatusLabel->setText(shouldSendLocalVideo()
+                                       ? QStringLiteral("正在与 %1 音视频通话").arg(peerName(peerId))
+                                       : QStringLiteral("正在与 %1 通话（仅接收图像）").arg(peerName(peerId)));
     }
     statusBar()->showMessage(QStringLiteral("%1 已接受音视频请求。").arg(peerName(peerId)), 4000);
     updateActionState();
@@ -588,6 +910,8 @@ void MainWindow::onCallEnded(const QString &peerId)
         m_activeCallPeerId.clear();
         m_lastRemoteFrame = QImage();
         m_lastLocalFrame = QImage();
+        m_pendingRemoteFrame = QImage();
+        m_pendingLocalFrame = QImage();
         refreshVideoLabels();
         if (m_callStatusLabel) {
             m_callStatusLabel->setText(QStringLiteral("未在通话中"));
@@ -607,10 +931,11 @@ void MainWindow::onRemoteVideoFrameReceived(const QString &peerId, const QImage 
         }
     }
     if (m_activeCallPeerId == peerId) {
-        m_lastRemoteFrame = frame;
-        setVideoLabelImage(m_remoteVideoLabel, m_lastRemoteFrame);
+        m_pendingRemoteFrame = frame;
         if (m_callStatusLabel) {
-            m_callStatusLabel->setText(QStringLiteral("正在与 %1 音视频通话").arg(peerName(peerId)));
+            m_callStatusLabel->setText(shouldSendLocalVideo()
+                                           ? QStringLiteral("正在与 %1 音视频通话").arg(peerName(peerId))
+                                           : QStringLiteral("正在与 %1 通话（仅接收图像）").arg(peerName(peerId)));
         }
     }
 }
@@ -647,8 +972,8 @@ void MainWindow::processLocalFrame(const QVideoFrame &frame)
         return;
     }
 
-    const QImage image = frameToDisplayImage(frame);
-    if (image.isNull()) {
+    const QImage displayImage = frameToDisplayImage(frame);
+    if (displayImage.isNull()) {
         if (!m_frameWarningLimiter.isValid() || m_frameWarningLimiter.elapsed() >= 3000) {
             qWarning().nospace()
                 << "Skipping local video frame: pixelFormat=" << frame.pixelFormat()
@@ -659,12 +984,24 @@ void MainWindow::processLocalFrame(const QVideoFrame &frame)
         return;
     }
 
-    m_lastLocalFrame = image;
-    setVideoLabelImage(m_localVideoLabel, m_lastLocalFrame);
+    m_pendingLocalFrame = displayImage;
 
-    if (!m_activeCallPeerId.isEmpty()) {
-        if (!m_frameLimiter.isValid() || m_frameLimiter.elapsed() >= 100) {
-            m_manager->sendVideoFrame(m_activeCallPeerId, image);
+    if (!m_localFrameLogTimer.isValid() || m_localFrameLogTimer.elapsed() >= 3000) {
+        const QImage transportImage = frameToTransportImage(frame, displayImage);
+        qInfo() << "Local video frame ready:"
+                << "pixelFormat =" << frame.pixelFormat()
+                << "frameSize =" << frame.size()
+                << "displayImageSize =" << displayImage.size()
+                << "transportImageSize =" << transportImage.size();
+        m_localFrameLogTimer.restart();
+    }
+
+    if (!m_activeCallPeerId.isEmpty() && shouldSendLocalVideo()) {
+        if (!m_frameLimiter.isValid() || m_frameLimiter.elapsed() >= localVideoSendIntervalMs()) {
+            const QImage transportImage = frameToTransportImage(frame, displayImage);
+            if (!transportImage.isNull()) {
+                m_manager->sendVideoFrame(m_activeCallPeerId, transportImage);
+            }
             m_frameLimiter.restart();
         }
     }
@@ -687,6 +1024,21 @@ void MainWindow::readLocalAudioInput()
                                   m_audioInputFormat.sampleRate(),
                                   m_audioInputFormat.channelCount(),
                                   static_cast<int>(m_audioInputFormat.sampleFormat()));
+    }
+}
+
+void MainWindow::flushVideoFrames()
+{
+    if (!m_pendingLocalFrame.isNull()) {
+        m_lastLocalFrame = m_pendingLocalFrame;
+        m_pendingLocalFrame = QImage();
+        setVideoLabelImage(m_localVideoLabel, m_lastLocalFrame);
+    }
+
+    if (!m_pendingRemoteFrame.isNull()) {
+        m_lastRemoteFrame = m_pendingRemoteFrame;
+        m_pendingRemoteFrame = QImage();
+        setVideoLabelImage(m_remoteVideoLabel, m_lastRemoteFrame);
     }
 }
 
@@ -769,15 +1121,34 @@ void MainWindow::buildUi()
     m_callStatusLabel = new QLabel(QStringLiteral("请选择一个联系人发起音视频通话"), callPage);
     m_callStatusLabel->setStyleSheet(QStringLiteral("font-size: 18px; font-weight: 600;"));
 
+    auto *cameraRow = new QHBoxLayout();
+    auto *cameraLabel = new QLabel(QStringLiteral("摄像头"), callPage);
+    m_cameraCombo = new QComboBox(callPage);
+    m_cameraApplyButton = new QPushButton(QStringLiteral("应用设备"), callPage);
+    m_receiveOnlyCheck = new QCheckBox(QStringLiteral("无摄像头时仅接收"), callPage);
+    m_receiveRemoteVideoOnlyCheck = new QCheckBox(QStringLiteral("仅接收图像"), callPage);
+    auto *decodeModeLabel = new QLabel(QStringLiteral("解码"), callPage);
+    m_decodeModeCombo = new QComboBox(callPage);
+    m_decodeModeApplyButton = new QPushButton(QStringLiteral("应用解码"), callPage);
+    m_decodeModeCombo->addItem(QStringLiteral("自动(Qt)"), VideoDecodeAuto);
+    m_decodeModeCombo->addItem(QStringLiteral("YUYV"), VideoDecodeYUYV);
+    m_decodeModeCombo->addItem(QStringLiteral("UYVY"), VideoDecodeUYVY);
+    m_decodeModeCombo->addItem(QStringLiteral("YVYU"), VideoDecodeYVYU);
+    m_decodeModeCombo->addItem(QStringLiteral("VYUY"), VideoDecodeVYUY);
+    cameraRow->addWidget(cameraLabel);
+    cameraRow->addWidget(m_cameraCombo, 1);
+    cameraRow->addWidget(m_cameraApplyButton);
+    cameraRow->addWidget(decodeModeLabel);
+    cameraRow->addWidget(m_decodeModeCombo);
+    cameraRow->addWidget(m_decodeModeApplyButton);
+    cameraRow->addWidget(m_receiveOnlyCheck);
+    cameraRow->addWidget(m_receiveRemoteVideoOnlyCheck);
+
     auto *videoRow = new QHBoxLayout();
-    m_localVideoLabel = new QLabel(QStringLiteral("本地画面"), callPage);
-    m_remoteVideoLabel = new QLabel(QStringLiteral("远端画面"), callPage);
-    for (QLabel *label : {m_localVideoLabel, m_remoteVideoLabel}) {
-        label->setMinimumSize(320, 240);
-        label->setAlignment(Qt::AlignCenter);
-        label->setStyleSheet(QStringLiteral("background:#111;color:#ddd;border:1px solid #444;"));
-        videoRow->addWidget(label);
-    }
+    m_localVideoLabel = new VideoFrameWidget(QStringLiteral("本地画面"), callPage);
+    m_remoteVideoLabel = new VideoFrameWidget(QStringLiteral("远端画面"), callPage);
+    videoRow->addWidget(m_localVideoLabel);
+    videoRow->addWidget(m_remoteVideoLabel);
 
     auto *callActionRow = new QHBoxLayout();
     m_videoButton = new QPushButton(QStringLiteral("发起音视频"), callPage);
@@ -787,6 +1158,7 @@ void MainWindow::buildUi()
     callActionRow->addStretch();
 
     callLayout->addWidget(m_callStatusLabel);
+    callLayout->addLayout(cameraRow);
     callLayout->addLayout(videoRow, 1);
     callLayout->addLayout(callActionRow);
 
@@ -805,6 +1177,10 @@ void MainWindow::buildUi()
     connect(m_messageEdit, &QLineEdit::returnPressed, this, &MainWindow::sendTextMessage);
     connect(m_fileButton, &QPushButton::clicked, this, &MainWindow::sendFileToPeer);
     connect(m_groupButton, &QPushButton::clicked, this, &MainWindow::createGroup);
+    connect(m_cameraApplyButton, &QPushButton::clicked, this, &MainWindow::applyCameraSelection);
+    connect(m_decodeModeApplyButton, &QPushButton::clicked, this, &MainWindow::applyVideoDecodeModeSelection);
+    connect(m_receiveOnlyCheck, &QCheckBox::toggled, this, &MainWindow::applyReceiveOnlySetting);
+    connect(m_receiveRemoteVideoOnlyCheck, &QCheckBox::toggled, this, &MainWindow::applyReceiveRemoteVideoOnlySetting);
     connect(m_videoButton, &QPushButton::clicked, this, &MainWindow::startVideoCall);
     connect(m_hangupButton, &QPushButton::clicked, this, &MainWindow::endVideoCall);
     connect(m_peerList, &QListWidget::currentItemChanged, this, &MainWindow::refreshConversationView);
@@ -820,6 +1196,42 @@ void MainWindow::appendHistoryLine(const QString &conversationKey, const QString
         return;
     }
     m_history[conversationKey].append(line);
+}
+
+void MainWindow::populateCameraDevices()
+{
+    if (!m_cameraCombo) {
+        return;
+    }
+
+    const QByteArray previousId = m_cameraCombo->currentData().toByteArray();
+    m_cameraCombo->clear();
+
+    const QList<QCameraDevice> devices = QMediaDevices::videoInputs();
+    for (const QCameraDevice &device : devices) {
+        m_cameraCombo->addItem(device.description(), device.id());
+    }
+
+    if (m_cameraCombo->count() == 0) {
+        m_cameraCombo->addItem(QStringLiteral("未检测到摄像头"), QByteArray());
+        m_cameraCombo->setEnabled(false);
+        if (m_cameraApplyButton) {
+            m_cameraApplyButton->setEnabled(false);
+        }
+        return;
+    }
+
+    m_cameraCombo->setEnabled(true);
+    if (m_cameraApplyButton) {
+        m_cameraApplyButton->setEnabled(true);
+    }
+
+    for (int index = 0; index < m_cameraCombo->count(); ++index) {
+        if (m_cameraCombo->itemData(index).toByteArray() == previousId) {
+            m_cameraCombo->setCurrentIndex(index);
+            return;
+        }
+    }
 }
 
 QString MainWindow::currentPeerId() const
@@ -859,6 +1271,20 @@ QString MainWindow::groupName(const QString &groupId) const
     return m_groups.contains(groupId) ? m_groups.value(groupId).name : groupId;
 }
 
+QCameraDevice MainWindow::selectedCameraDevice() const
+{
+    const QList<QCameraDevice> devices = QMediaDevices::videoInputs();
+    const QByteArray selectedId = m_cameraCombo ? m_cameraCombo->currentData().toByteArray() : QByteArray();
+
+    for (const QCameraDevice &device : devices) {
+        if (!selectedId.isEmpty() && device.id() == selectedId) {
+            return device;
+        }
+    }
+
+    return QMediaDevices::defaultVideoInput();
+}
+
 void MainWindow::selectGroup(const QString &groupId)
 {
     m_sidebarTabs->setCurrentWidget(m_groupList);
@@ -878,9 +1304,8 @@ bool MainWindow::ensureCameraRunning()
         return true;
     }
 
-    const QCameraDevice cameraDevice = QMediaDevices::defaultVideoInput();
+    const QCameraDevice cameraDevice = selectedCameraDevice();
     if (cameraDevice.isNull()) {
-        QMessageBox::warning(this, QStringLiteral("摄像头不可用"), QStringLiteral("当前系统没有检测到可用摄像头。"));
         return false;
     }
 
@@ -895,6 +1320,16 @@ bool MainWindow::ensureCameraRunning()
                 << ", minFrameRate=" << candidate.minFrameRate()
                 << ", maxFrameRate=" << candidate.maxFrameRate();
         }
+
+        const QCameraFormat requestedFormat = preferredCameraFormat(cameraDevice);
+        if (requestedFormat.pixelFormat() != QVideoFrameFormat::Format_Invalid) {
+            m_camera->setCameraFormat(requestedFormat);
+            qInfo().nospace()
+                << "Requested camera format for " << cameraDevice.description()
+                << ": " << requestedFormat.resolution().width() << "x" << requestedFormat.resolution().height()
+                << ", pixelFormat=" << requestedFormat.pixelFormat()
+                << ", maxFrameRate=" << requestedFormat.maxFrameRate();
+        }
     }
 
     m_captureSession.setCamera(m_camera);
@@ -908,6 +1343,44 @@ bool MainWindow::ensureCameraRunning()
         << ", pixelFormat=" << activeFormat.pixelFormat()
         << ", maxFrameRate=" << activeFormat.maxFrameRate();
     return true;
+}
+
+bool MainWindow::prepareCallCamera()
+{
+    if (!shouldSendLocalVideo()) {
+        stopCamera();
+        statusBar()->showMessage(QStringLiteral("当前为仅接收图像模式，本地不会发送视频。"), 4000);
+        return true;
+    }
+
+    if (ensureCameraRunning()) {
+        return true;
+    }
+
+    const bool receiveOnlyEnabled = m_receiveOnlyCheck && m_receiveOnlyCheck->isChecked();
+    if (!receiveOnlyEnabled) {
+        QMessageBox::warning(this, QStringLiteral("摄像头不可用"), QStringLiteral("当前系统没有检测到可用摄像头。"));
+        return false;
+    }
+
+    QMessageBox::information(this,
+                             QStringLiteral("仅接收模式"),
+                             QStringLiteral("当前没有可用摄像头，将继续通话并仅接收对端画面，本地不会发送视频。"));
+    if (m_callStatusLabel && !m_activeCallPeerId.isEmpty()) {
+        m_callStatusLabel->setText(QStringLiteral("正在与 %1 音视频通话（仅接收视频）").arg(peerName(m_activeCallPeerId)));
+    }
+    statusBar()->showMessage(QStringLiteral("当前没有可用摄像头，已切换到仅接收模式。"), 4000);
+    return true;
+}
+
+bool MainWindow::shouldSendLocalVideo() const
+{
+    return !(m_receiveRemoteVideoOnlyCheck && m_receiveRemoteVideoOnlyCheck->isChecked());
+}
+
+int MainWindow::selectedVideoDecodeMode() const
+{
+    return m_decodeModeCombo ? m_decodeModeCombo->currentData().toInt() : VideoDecodeAuto;
 }
 
 bool MainWindow::startAudioCapture()
@@ -1029,20 +1502,22 @@ void MainWindow::stopCamera()
     m_camera->deleteLater();
     m_camera = nullptr;
     m_lastLocalFrame = QImage();
+    m_pendingLocalFrame = QImage();
     refreshVideoLabels();
 }
 
-void MainWindow::setVideoLabelImage(QLabel *label, const QImage &image)
+void MainWindow::setVideoLabelImage(VideoFrameWidget *widget, const QImage &image)
 {
-    if (image.isNull()) {
-        label->clear();
-        label->setText(label == m_localVideoLabel ? QStringLiteral("本地画面") : QStringLiteral("远端画面"));
+    if (!widget) {
         return;
     }
 
-    const QSize targetSize = label->contentsRect().size().expandedTo(QSize(1, 1));
-    label->setText(QString());
-    label->setPixmap(QPixmap::fromImage(image).scaled(targetSize, Qt::KeepAspectRatio, Qt::SmoothTransformation));
+    if (image.isNull()) {
+        widget->clearFrame();
+        return;
+    }
+
+    widget->setFrame(image);
 }
 
 void MainWindow::refreshVideoLabels()

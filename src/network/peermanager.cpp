@@ -34,6 +34,24 @@ QString timestampIso()
     return QDateTime::currentDateTime().toString(Qt::ISODate);
 }
 
+QSize transportVideoSize()
+{
+#ifdef Q_OS_LINUX
+    return QSize(480, 270);
+#else
+    return QSize(640, 360);
+#endif
+}
+
+int transportJpegQuality()
+{
+#ifdef Q_OS_LINUX
+    return 60;
+#else
+    return 80;
+#endif
+}
+
 bool looksLikeJpeg(const QByteArray &bytes)
 {
     return bytes.size() >= 4
@@ -64,16 +82,16 @@ QImage normalizeFrameForTransport(const QImage &frame, const QSize &targetSize)
         return {};
     }
 
-    QImage normalized = frame.convertToFormat(QImage::Format_RGB888);
+    QImage normalized = frame.convertToFormat(QImage::Format_RGB32);
     if (normalized.isNull()) {
         return {};
     }
 
-    QImage canvas(targetSize, QImage::Format_RGB888);
+    QImage canvas(targetSize, QImage::Format_RGB32);
     canvas.fill(Qt::black);
 
     const QSize scaledSize = normalized.size().scaled(targetSize, Qt::KeepAspectRatio);
-    const QImage scaledFrame = normalized.scaled(scaledSize, Qt::KeepAspectRatio, Qt::SmoothTransformation);
+    const QImage scaledFrame = normalized.scaled(scaledSize, Qt::KeepAspectRatio, Qt::FastTransformation);
     if (scaledFrame.isNull()) {
         return {};
     }
@@ -302,7 +320,7 @@ void PeerManager::sendVideoFrame(const QString &peerId, const QImage &frame)
         return;
     }
 
-    const QImage scaledFrame = normalizeFrameForTransport(frame, QSize(640, 360));
+    const QImage scaledFrame = normalizeFrameForTransport(frame, transportVideoSize());
     if (scaledFrame.isNull()) {
         qWarning() << "Dropping local video frame: failed to normalize image before encoding";
         return;
@@ -312,7 +330,7 @@ void PeerManager::sendVideoFrame(const QString &peerId, const QImage &frame)
     QBuffer buffer(&imageBytes);
     buffer.open(QIODevice::WriteOnly);
     const QByteArray imageFormat = "JPG";
-    constexpr int imageQuality = 80;
+    const int imageQuality = transportJpegQuality();
     if (!scaledFrame.save(&buffer, imageFormat.constData(), imageQuality)
         || !looksLikeImageFormat(imageBytes, imageFormat)) {
         qWarning() << "Dropping local video frame: failed to encode a valid" << imageFormat << "payload";
@@ -418,7 +436,23 @@ void PeerManager::onPacketReceived(PeerConnection *connection, const QString &ty
         return;
     }
 
-    const QString peerId = m_peerIdsByConnection.value(connection);
+    QString peerId = m_peerIdsByConnection.value(connection);
+    if (peerId.isEmpty()) {
+        QString metaPeerId = meta.value(QStringLiteral("fromId")).toString();
+        QString metaPeerName = meta.value(QStringLiteral("fromName")).toString();
+
+        if (metaPeerId.isEmpty()) {
+            metaPeerId = meta.value(QStringLiteral("creatorId")).toString();
+            metaPeerName = meta.value(QStringLiteral("creatorName")).toString();
+        }
+
+        if (!metaPeerId.isEmpty() && metaPeerId != m_localPeerId) {
+            registerConnection(connection,
+                               metaPeerId,
+                               metaPeerName.isEmpty() ? peerDisplayName(metaPeerId) : metaPeerName);
+            peerId = metaPeerId;
+        }
+    }
 
     if (type == QLatin1String("direct_message")) {
         const QDateTime ts = QDateTime::fromString(meta.value(QStringLiteral("timestamp")).toString(), Qt::ISODate);
@@ -494,7 +528,7 @@ void PeerManager::onPacketReceived(PeerConnection *connection, const QString &ty
             return;
         }
 
-        const QImage displayFrame = frame.convertToFormat(QImage::Format_RGB32);
+        const QImage displayFrame = frame.convertToFormat(QImage::Format_RGB32).copy();
         if (displayFrame.isNull()) {
             qWarning() << "Dropping remote video frame from" << peerId << ": failed to convert decoded frame for display";
             return;
@@ -647,6 +681,7 @@ PeerConnection *PeerManager::ensureConnection(const QString &peerId)
 
     auto *connection = new PeerConnection(socket, this);
     wireConnection(connection);
+    registerConnection(connection, peerId, peer.name);
     sendHello(connection);
     return connection;
 }

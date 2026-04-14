@@ -17,15 +17,20 @@ class PeerManager;
 class QAudioSink;
 class QAudioSource;
 class QCamera;
+class QCameraDevice;
+class QCheckBox;
+class QComboBox;
 class QIODevice;
 class QLineEdit;
 class QListWidget;
 class QPlainTextEdit;
 class QPushButton;
 class QTabWidget;
-class QLabel;
+class QTimer;
 class QVideoFrame;
 class QVideoSink;
+class QLabel;
+class VideoFrameWidget;
 
 class MainWindow : public QMainWindow
 {
@@ -40,6 +45,10 @@ protected:
 
 private slots:
     void applyDisplayName();
+    void applyCameraSelection();
+    void applyVideoDecodeModeSelection();
+    void applyReceiveOnlySetting(bool enabled);
+    void applyReceiveRemoteVideoOnlySetting(bool enabled);
     void triggerPeerDiscovery();
     void sendTextMessage();
     void sendFileToPeer();
@@ -60,16 +69,22 @@ private slots:
     void onRemoteAudioChunkReceived(const QString &peerId, const QByteArray &audioData, int sampleRate, int channelCount, int sampleFormat);
     void processLocalFrame(const QVideoFrame &frame);
     void readLocalAudioInput();
+    void flushVideoFrames();
     void updateActionState();
 
 private:
     void buildUi();
     void appendHistoryLine(const QString &conversationKey, const QString &line);
+    void populateCameraDevices();
+    bool prepareCallCamera();
+    bool shouldSendLocalVideo() const;
+    int selectedVideoDecodeMode() const;
     QString currentPeerId() const;
     QString currentGroupId() const;
     QString currentConversationKey() const;
     QString peerName(const QString &peerId) const;
     QString groupName(const QString &groupId) const;
+    QCameraDevice selectedCameraDevice() const;
     void selectGroup(const QString &groupId);
     bool ensureCameraRunning();
     bool startAudioCapture();
@@ -78,7 +93,7 @@ private:
     void stopAudioPlayback();
     void stopCallMedia();
     void stopCamera();
-    void setVideoLabelImage(QLabel *label, const QImage &image);
+    void setVideoLabelImage(VideoFrameWidget *widget, const QImage &image);
     void refreshVideoLabels();
 
     PeerManager *m_manager = nullptr;
@@ -93,10 +108,16 @@ private:
     QPushButton *m_sendButton = nullptr;
     QPushButton *m_fileButton = nullptr;
     QPushButton *m_groupButton = nullptr;
+    QPushButton *m_cameraApplyButton = nullptr;
+    QPushButton *m_decodeModeApplyButton = nullptr;
     QPushButton *m_videoButton = nullptr;
     QPushButton *m_hangupButton = nullptr;
-    QLabel *m_localVideoLabel = nullptr;
-    QLabel *m_remoteVideoLabel = nullptr;
+    QCheckBox *m_receiveOnlyCheck = nullptr;
+    QCheckBox *m_receiveRemoteVideoOnlyCheck = nullptr;
+    QComboBox *m_cameraCombo = nullptr;
+    QComboBox *m_decodeModeCombo = nullptr;
+    VideoFrameWidget *m_localVideoLabel = nullptr;
+    VideoFrameWidget *m_remoteVideoLabel = nullptr;
     QLabel *m_conversationTitle = nullptr;
     QLabel *m_callStatusLabel = nullptr;
 
@@ -108,6 +129,7 @@ private:
     QCamera *m_camera = nullptr;
     QMediaCaptureSession m_captureSession;
     QVideoSink *m_videoSink = nullptr;
+    QTimer *m_videoRefreshTimer = nullptr;
     QAudioSource *m_audioSource = nullptr;
     QIODevice *m_audioInputDevice = nullptr;
     QAudioSink *m_audioSink = nullptr;
@@ -116,6 +138,9 @@ private:
     QAudioFormat m_audioOutputFormat;
     QElapsedTimer m_frameLimiter;
     QElapsedTimer m_frameWarningLimiter;
+    QElapsedTimer m_localFrameLogTimer;
     QImage m_lastLocalFrame;
     QImage m_lastRemoteFrame;
+    QImage m_pendingLocalFrame;
+    QImage m_pendingRemoteFrame;
 };
