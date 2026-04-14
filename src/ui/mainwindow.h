@@ -6,6 +6,7 @@
 #include <QHash>
 #include <QImage>
 #include <QMainWindow>
+#include <QResizeEvent>
 
 #include <QMediaCaptureSession>
 
@@ -33,6 +34,9 @@ class MainWindow : public QMainWindow
 public:
     explicit MainWindow(QWidget *parent = nullptr);
     ~MainWindow() override;
+
+protected:
+    void resizeEvent(QResizeEvent *event) override;
 
 private slots:
     void applyDisplayName();
@@ -75,6 +79,7 @@ private:
     void stopCallMedia();
     void stopCamera();
     void setVideoLabelImage(QLabel *label, const QImage &image);
+    void refreshVideoLabels();
 
     PeerManager *m_manager = nullptr;
     QLineEdit *m_nameEdit = nullptr;
@@ -110,4 +115,7 @@ private:
     QAudioFormat m_audioInputFormat;
     QAudioFormat m_audioOutputFormat;
     QElapsedTimer m_frameLimiter;
+    QElapsedTimer m_frameWarningLimiter;
+    QImage m_lastLocalFrame;
+    QImage m_lastRemoteFrame;
 };

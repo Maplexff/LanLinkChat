@@ -4,6 +4,7 @@
 #include <QBuffer>
 #include <QCoreApplication>
 #include <QDateTime>
+#include <QDebug>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
@@ -11,6 +12,7 @@
 #include <QHostInfo>
 #include <QJsonArray>
 #include <QJsonObject>
+#include <QPainter>
 #include <QStandardPaths>
 #include <QTcpServer>
 #include <QTcpSocket>
@@ -32,6 +34,57 @@ QString timestampIso()
     return QDateTime::currentDateTime().toString(Qt::ISODate);
 }
 
+bool looksLikeJpeg(const QByteArray &bytes)
+{
+    return bytes.size() >= 4
+        && static_cast<uchar>(bytes.at(0)) == 0xFF
+        && static_cast<uchar>(bytes.at(1)) == 0xD8
+        && static_cast<uchar>(bytes.at(bytes.size() - 2)) == 0xFF
+        && static_cast<uchar>(bytes.at(bytes.size() - 1)) == 0xD9;
+}
+
+bool looksLikePng(const QByteArray &bytes)
+{
+    static const QByteArray signature = QByteArray::fromHex("89504E470D0A1A0A");
+    return bytes.startsWith(signature);
+}
+
+bool looksLikeImageFormat(const QByteArray &bytes, const QByteArray &format)
+{
+    const QByteArray normalizedFormat = format.trimmed().toUpper();
+    if (normalizedFormat == "PNG") {
+        return looksLikePng(bytes);
+    }
+    return looksLikeJpeg(bytes);
+}
+
+QImage normalizeFrameForTransport(const QImage &frame, const QSize &targetSize)
+{
+    if (frame.isNull() || !targetSize.isValid()) {
+        return {};
+    }
+
+    QImage normalized = frame.convertToFormat(QImage::Format_RGB888);
+    if (normalized.isNull()) {
+        return {};
+    }
+
+    QImage canvas(targetSize, QImage::Format_RGB888);
+    canvas.fill(Qt::black);
+
+    const QSize scaledSize = normalized.size().scaled(targetSize, Qt::KeepAspectRatio);
+    const QImage scaledFrame = normalized.scaled(scaledSize, Qt::KeepAspectRatio, Qt::SmoothTransformation);
+    if (scaledFrame.isNull()) {
+        return {};
+    }
+
+    QPainter painter(&canvas);
+    const QPoint topLeft((targetSize.width() - scaledSize.width()) / 2,
+                         (targetSize.height() - scaledSize.height()) / 2);
+    painter.drawImage(topLeft, scaledFrame);
+    return canvas;
+}
+
 }
 
 PeerManager::PeerManager(QObject *parent)
@@ -42,6 +95,8 @@ PeerManager::PeerManager(QObject *parent)
     , m_server(new QTcpServer(this))
     , m_pruneTimer(new QTimer(this))
 {
+    m_videoLogTimer.start();
+
     m_server->listen(QHostAddress::AnyIPv4, 0);
 
     m_discovery->setLocalPeer(m_localPeerId, m_displayName, m_server->serverPort());
@@ -247,15 +302,64 @@ void PeerManager::sendVideoFrame(const QString &peerId, const QImage &frame)
         return;
     }
 
-    QByteArray jpegBytes;
-    QBuffer buffer(&jpegBytes);
+    const QImage scaledFrame = normalizeFrameForTransport(frame, QSize(640, 360));
+    if (scaledFrame.isNull()) {
+        qWarning() << "Dropping local video frame: failed to normalize image before encoding";
+        return;
+    }
+
+    QByteArray imageBytes;
+    QBuffer buffer(&imageBytes);
     buffer.open(QIODevice::WriteOnly);
-    frame.scaled(640, 360, Qt::KeepAspectRatio, Qt::SmoothTransformation).save(&buffer, "JPG", 70);
+    const QByteArray imageFormat = "JPG";
+    constexpr int imageQuality = 80;
+    if (!scaledFrame.save(&buffer, imageFormat.constData(), imageQuality)
+        || !looksLikeImageFormat(imageBytes, imageFormat)) {
+        qWarning() << "Dropping local video frame: failed to encode a valid" << imageFormat << "payload";
+        return;
+    }
+
+    sendEncodedVideoFrame(peerId, imageBytes, QString::fromLatin1(imageFormat), scaledFrame.size());
+}
+
+void PeerManager::sendEncodedVideoFrame(const QString &peerId,
+                                        const QByteArray &encodedFrame,
+                                        const QString &imageFormat,
+                                        const QSize &frameSize)
+{
+    if (encodedFrame.isEmpty()) {
+        return;
+    }
+
+    PeerConnection *connection = ensureConnection(peerId);
+    if (!connection) {
+        return;
+    }
+
+    const QByteArray normalizedFormat = imageFormat.trimmed().toLatin1().toUpper();
+    if (!looksLikeImageFormat(encodedFrame, normalizedFormat)) {
+        qWarning() << "Dropping local video frame: invalid encoded payload for" << normalizedFormat;
+        return;
+    }
 
     QJsonObject meta;
     meta.insert(QStringLiteral("fromId"), m_localPeerId);
     meta.insert(QStringLiteral("timestamp"), timestampIso());
-    connection->sendPacket(QStringLiteral("video_frame"), meta, jpegBytes);
+    const quint64 frameNumber = ++m_sentVideoFrames[peerId];
+    meta.insert(QStringLiteral("frameNumber"), static_cast<qint64>(frameNumber));
+    meta.insert(QStringLiteral("width"), frameSize.width());
+    meta.insert(QStringLiteral("height"), frameSize.height());
+    meta.insert(QStringLiteral("imageFormat"), QString::fromLatin1(normalizedFormat));
+    connection->sendPacket(QStringLiteral("video_frame"), meta, encodedFrame);
+
+    if (m_videoLogTimer.elapsed() >= 3000) {
+        qInfo() << "Video tx peer =" << peerId
+                << "frame =" << frameNumber
+                << "size =" << encodedFrame.size()
+                << "resolution =" << frameSize
+                << "format =" << normalizedFormat;
+        m_videoLogTimer.restart();
+    }
 }
 
 void PeerManager::sendAudioChunk(const QString &peerId, const QByteArray &audioData, int sampleRate, int channelCount, int sampleFormat)
@@ -300,6 +404,7 @@ void PeerManager::acceptPendingConnections()
 {
     while (m_server->hasPendingConnections()) {
         QTcpSocket *socket = m_server->nextPendingConnection();
+        socket->setSocketOption(QAbstractSocket::LowDelayOption, 1);
         auto *connection = new PeerConnection(socket, this);
         wireConnection(connection);
         sendHello(connection);
@@ -375,11 +480,39 @@ void PeerManager::onPacketReceived(PeerConnection *connection, const QString &ty
     }
 
     if (type == QLatin1String("video_frame")) {
-        QImage frame;
-        frame.loadFromData(binary, "JPG");
-        if (!frame.isNull()) {
-            emit remoteVideoFrameReceived(peerId, frame);
+        const QByteArray imageFormat = meta.value(QStringLiteral("imageFormat")).toString().toLatin1().toUpper();
+        const QByteArray effectiveFormat = imageFormat.isEmpty() ? QByteArray("JPG") : imageFormat;
+        const bool signatureValid = effectiveFormat == "PNG" ? looksLikePng(binary) : looksLikeJpeg(binary);
+        if (!signatureValid) {
+            qWarning() << "Dropping remote video frame from" << peerId << ": invalid" << effectiveFormat << "payload, size =" << binary.size();
+            return;
         }
+
+        QImage frame;
+        if (!frame.loadFromData(binary, effectiveFormat.constData()) || frame.isNull()) {
+            qWarning() << "Dropping remote video frame from" << peerId << ":" << effectiveFormat << "decode failed, size =" << binary.size();
+            return;
+        }
+
+        const QImage displayFrame = frame.convertToFormat(QImage::Format_RGB32);
+        if (displayFrame.isNull()) {
+            qWarning() << "Dropping remote video frame from" << peerId << ": failed to convert decoded frame for display";
+            return;
+        }
+
+        const quint64 receivedFrameNumber = ++m_receivedVideoFrames[peerId];
+        const qint64 announcedFrameNumber = static_cast<qint64>(meta.value(QStringLiteral("frameNumber")).toDouble(-1));
+        if (m_videoLogTimer.elapsed() >= 3000) {
+            qInfo() << "Video rx peer =" << peerId
+                    << "frame =" << receivedFrameNumber
+                    << "announced =" << announcedFrameNumber
+                    << "size =" << binary.size()
+                    << "resolution =" << displayFrame.size()
+                    << "format =" << effectiveFormat;
+            m_videoLogTimer.restart();
+        }
+
+        emit remoteVideoFrameReceived(peerId, displayFrame);
         return;
     }
 
@@ -505,6 +638,7 @@ PeerConnection *PeerManager::ensureConnection(const QString &peerId)
     }
 
     auto *socket = new QTcpSocket(this);
+    socket->setSocketOption(QAbstractSocket::LowDelayOption, 1);
     socket->connectToHost(peer.address, peer.port);
     if (!socket->waitForConnected(3000)) {
         socket->deleteLater();

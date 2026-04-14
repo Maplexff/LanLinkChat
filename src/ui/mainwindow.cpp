@@ -6,7 +6,10 @@
 #include <QAudioSink>
 #include <QAudioSource>
 #include <QCamera>
+#include <QCameraDevice>
+#include <QCameraFormat>
 #include <QDateTime>
+#include <QDebug>
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QFileDialog>
@@ -32,6 +35,7 @@
 #include <QTextOption>
 #include <QVBoxLayout>
 #include <QVideoFrame>
+#include <QVideoFrameFormat>
 #include <QVideoSink>
 #include <QWidget>
 
@@ -61,6 +65,172 @@ QAudioFormat formatFromWire(int sampleRate, int channelCount, int sampleFormat)
     format.setChannelCount(channelCount);
     format.setSampleFormat(static_cast<QAudioFormat::SampleFormat>(sampleFormat));
     return format;
+}
+
+int clampColor(int value)
+{
+    return qBound(0, value, 255);
+}
+
+QRgb yuvToRgb(int yValue, int uValue, int vValue)
+{
+    const int c = qMax(0, yValue - 16);
+    const int d = uValue - 128;
+    const int e = vValue - 128;
+    const int r = clampColor((298 * c + 409 * e + 128) >> 8);
+    const int g = clampColor((298 * c - 100 * d - 208 * e + 128) >> 8);
+    const int b = clampColor((298 * c + 516 * d + 128) >> 8);
+    return qRgb(r, g, b);
+}
+
+QImage convertPackedYuv422FrameToImage(const QVideoFrame &frame, bool yuyvLayout)
+{
+    QVideoFrame mappedFrame(frame);
+    if (!mappedFrame.map(QVideoFrame::ReadOnly)) {
+        return {};
+    }
+
+    const QSize size = mappedFrame.size();
+    if (!size.isValid() || size.width() < 2 || size.height() < 1) {
+        mappedFrame.unmap();
+        return {};
+    }
+
+    const uchar *source = mappedFrame.bits(0);
+    const int bytesPerLine = mappedFrame.bytesPerLine(0);
+    if (!source || bytesPerLine <= 0) {
+        mappedFrame.unmap();
+        return {};
+    }
+
+    QImage image(size, QImage::Format_RGB32);
+    if (image.isNull()) {
+        mappedFrame.unmap();
+        return {};
+    }
+
+    for (int y = 0; y < size.height(); ++y) {
+        const uchar *line = source + y * bytesPerLine;
+        QRgb *dest = reinterpret_cast<QRgb *>(image.scanLine(y));
+
+        for (int x = 0; x + 1 < size.width(); x += 2) {
+            const int offset = x * 2;
+            const int y0 = yuyvLayout ? line[offset + 0] : line[offset + 1];
+            const int u = yuyvLayout ? line[offset + 1] : line[offset + 0];
+            const int y1 = yuyvLayout ? line[offset + 2] : line[offset + 3];
+            const int v = yuyvLayout ? line[offset + 3] : line[offset + 2];
+
+            dest[x] = yuvToRgb(y0, u, v);
+            dest[x + 1] = yuvToRgb(y1, u, v);
+        }
+    }
+
+    mappedFrame.unmap();
+    return image;
+}
+
+QImage convertPlanarYuv420FrameToImage(const QVideoFrame &frame, bool nv21Layout, bool yv12Layout)
+{
+    QVideoFrame mappedFrame(frame);
+    if (!mappedFrame.map(QVideoFrame::ReadOnly)) {
+        return {};
+    }
+
+    const QSize size = mappedFrame.size();
+    if (!size.isValid()) {
+        mappedFrame.unmap();
+        return {};
+    }
+
+    const uchar *yPlane = mappedFrame.bits(0);
+    const int yStride = mappedFrame.bytesPerLine(0);
+    if (!yPlane || yStride <= 0) {
+        mappedFrame.unmap();
+        return {};
+    }
+
+    const bool isSemiPlanar = mappedFrame.planeCount() >= 2 && mappedFrame.bits(1);
+    const uchar *uPlane = nullptr;
+    const uchar *vPlane = nullptr;
+    int uStride = 0;
+    int vStride = 0;
+    const uchar *uvPlane = nullptr;
+    int uvStride = 0;
+
+    if (isSemiPlanar) {
+        uvPlane = mappedFrame.bits(1);
+        uvStride = mappedFrame.bytesPerLine(1);
+        if (!uvPlane || uvStride <= 0) {
+            mappedFrame.unmap();
+            return {};
+        }
+    } else {
+        uPlane = mappedFrame.bits(yv12Layout ? 2 : 1);
+        vPlane = mappedFrame.bits(yv12Layout ? 1 : 2);
+        uStride = mappedFrame.bytesPerLine(yv12Layout ? 2 : 1);
+        vStride = mappedFrame.bytesPerLine(yv12Layout ? 1 : 2);
+        if (!uPlane || !vPlane || uStride <= 0 || vStride <= 0) {
+            mappedFrame.unmap();
+            return {};
+        }
+    }
+
+    QImage image(size, QImage::Format_RGB32);
+    if (image.isNull()) {
+        mappedFrame.unmap();
+        return {};
+    }
+
+    for (int y = 0; y < size.height(); ++y) {
+        const uchar *yRow = yPlane + y * yStride;
+        QRgb *dest = reinterpret_cast<QRgb *>(image.scanLine(y));
+        const int chromaY = y / 2;
+
+        for (int x = 0; x < size.width(); ++x) {
+            const int chromaX = x / 2;
+            int u = 128;
+            int v = 128;
+
+            if (isSemiPlanar) {
+                const uchar *uvRow = uvPlane + chromaY * uvStride;
+                const int uvOffset = chromaX * 2;
+                u = nv21Layout ? uvRow[uvOffset + 1] : uvRow[uvOffset + 0];
+                v = nv21Layout ? uvRow[uvOffset + 0] : uvRow[uvOffset + 1];
+            } else {
+                u = *(uPlane + chromaY * uStride + chromaX);
+                v = *(vPlane + chromaY * vStride + chromaX);
+            }
+
+            dest[x] = yuvToRgb(yRow[x], u, v);
+        }
+    }
+
+    mappedFrame.unmap();
+    return image;
+}
+
+QImage frameToDisplayImage(const QVideoFrame &frame)
+{
+    if (const QImage directImage = frame.toImage(); !directImage.isNull()) {
+        return directImage;
+    }
+
+    switch (frame.pixelFormat()) {
+    case QVideoFrameFormat::Format_YUYV:
+        return convertPackedYuv422FrameToImage(frame, true);
+    case QVideoFrameFormat::Format_UYVY:
+        return convertPackedYuv422FrameToImage(frame, false);
+    case QVideoFrameFormat::Format_NV12:
+        return convertPlanarYuv420FrameToImage(frame, false, false);
+    case QVideoFrameFormat::Format_NV21:
+        return convertPlanarYuv420FrameToImage(frame, true, false);
+    case QVideoFrameFormat::Format_YUV420P:
+        return convertPlanarYuv420FrameToImage(frame, false, false);
+    case QVideoFrameFormat::Format_YV12:
+        return convertPlanarYuv420FrameToImage(frame, false, true);
+    default:
+        return {};
+    }
 }
 
 }
@@ -101,6 +271,12 @@ MainWindow::MainWindow(QWidget *parent)
 MainWindow::~MainWindow()
 {
     stopCallMedia();
+}
+
+void MainWindow::resizeEvent(QResizeEvent *event)
+{
+    QMainWindow::resizeEvent(event);
+    refreshVideoLabels();
 }
 
 void MainWindow::applyDisplayName()
@@ -246,8 +422,9 @@ void MainWindow::endVideoCall()
     m_manager->endCall(m_activeCallPeerId);
     statusBar()->showMessage(QStringLiteral("音视频通话已结束。"), 3000);
     m_activeCallPeerId.clear();
-    m_remoteVideoLabel->setText(QStringLiteral("远端画面"));
-    m_localVideoLabel->setText(QStringLiteral("本地画面"));
+    m_lastRemoteFrame = QImage();
+    m_lastLocalFrame = QImage();
+    refreshVideoLabels();
     if (m_callStatusLabel) {
         m_callStatusLabel->setText(QStringLiteral("未在通话中"));
     }
@@ -409,8 +586,9 @@ void MainWindow::onCallEnded(const QString &peerId)
 {
     if (m_activeCallPeerId == peerId) {
         m_activeCallPeerId.clear();
-        m_remoteVideoLabel->setText(QStringLiteral("远端画面"));
-        m_localVideoLabel->setText(QStringLiteral("本地画面"));
+        m_lastRemoteFrame = QImage();
+        m_lastLocalFrame = QImage();
+        refreshVideoLabels();
         if (m_callStatusLabel) {
             m_callStatusLabel->setText(QStringLiteral("未在通话中"));
         }
@@ -429,7 +607,8 @@ void MainWindow::onRemoteVideoFrameReceived(const QString &peerId, const QImage 
         }
     }
     if (m_activeCallPeerId == peerId) {
-        setVideoLabelImage(m_remoteVideoLabel, frame);
+        m_lastRemoteFrame = frame;
+        setVideoLabelImage(m_remoteVideoLabel, m_lastRemoteFrame);
         if (m_callStatusLabel) {
             m_callStatusLabel->setText(QStringLiteral("正在与 %1 音视频通话").arg(peerName(peerId)));
         }
@@ -464,12 +643,24 @@ void MainWindow::onRemoteAudioChunkReceived(const QString &peerId,
 
 void MainWindow::processLocalFrame(const QVideoFrame &frame)
 {
-    const QImage image = frame.toImage();
-    if (image.isNull()) {
+    if (!frame.isValid()) {
         return;
     }
 
-    setVideoLabelImage(m_localVideoLabel, image);
+    const QImage image = frameToDisplayImage(frame);
+    if (image.isNull()) {
+        if (!m_frameWarningLimiter.isValid() || m_frameWarningLimiter.elapsed() >= 3000) {
+            qWarning().nospace()
+                << "Skipping local video frame: pixelFormat=" << frame.pixelFormat()
+                << ", size=" << frame.size();
+            statusBar()->showMessage(QStringLiteral("摄像头视频帧转换失败，已跳过异常帧。"), 3000);
+            m_frameWarningLimiter.restart();
+        }
+        return;
+    }
+
+    m_lastLocalFrame = image;
+    setVideoLabelImage(m_localVideoLabel, m_lastLocalFrame);
 
     if (!m_activeCallPeerId.isEmpty()) {
         if (!m_frameLimiter.isValid() || m_frameLimiter.elapsed() >= 100) {
@@ -687,15 +878,35 @@ bool MainWindow::ensureCameraRunning()
         return true;
     }
 
-    if (QMediaDevices::defaultVideoInput().isNull()) {
+    const QCameraDevice cameraDevice = QMediaDevices::defaultVideoInput();
+    if (cameraDevice.isNull()) {
         QMessageBox::warning(this, QStringLiteral("摄像头不可用"), QStringLiteral("当前系统没有检测到可用摄像头。"));
         return false;
     }
 
-    m_camera = new QCamera(QMediaDevices::defaultVideoInput(), this);
+    m_camera = new QCamera(cameraDevice, this);
+    if (!cameraDevice.videoFormats().isEmpty()) {
+        qInfo() << "Available camera formats for" << cameraDevice.description() << ":";
+        for (const QCameraFormat &candidate : cameraDevice.videoFormats()) {
+            qInfo().nospace()
+                << "  "
+                << candidate.resolution().width() << "x" << candidate.resolution().height()
+                << ", pixelFormat=" << candidate.pixelFormat()
+                << ", minFrameRate=" << candidate.minFrameRate()
+                << ", maxFrameRate=" << candidate.maxFrameRate();
+        }
+    }
+
     m_captureSession.setCamera(m_camera);
     m_captureSession.setVideoSink(m_videoSink);
     m_camera->start();
+
+    const QCameraFormat activeFormat = m_camera->cameraFormat();
+    qInfo().nospace()
+        << "Active camera format for " << cameraDevice.description()
+        << ": " << activeFormat.resolution().width() << "x" << activeFormat.resolution().height()
+        << ", pixelFormat=" << activeFormat.pixelFormat()
+        << ", maxFrameRate=" << activeFormat.maxFrameRate();
     return true;
 }
 
@@ -817,10 +1028,25 @@ void MainWindow::stopCamera()
     m_camera->stop();
     m_camera->deleteLater();
     m_camera = nullptr;
-    m_localVideoLabel->setText(QStringLiteral("本地画面"));
+    m_lastLocalFrame = QImage();
+    refreshVideoLabels();
 }
 
 void MainWindow::setVideoLabelImage(QLabel *label, const QImage &image)
 {
-    label->setPixmap(QPixmap::fromImage(image).scaled(label->size(), Qt::KeepAspectRatio, Qt::SmoothTransformation));
+    if (image.isNull()) {
+        label->clear();
+        label->setText(label == m_localVideoLabel ? QStringLiteral("本地画面") : QStringLiteral("远端画面"));
+        return;
+    }
+
+    const QSize targetSize = label->contentsRect().size().expandedTo(QSize(1, 1));
+    label->setText(QString());
+    label->setPixmap(QPixmap::fromImage(image).scaled(targetSize, Qt::KeepAspectRatio, Qt::SmoothTransformation));
+}
+
+void MainWindow::refreshVideoLabels()
+{
+    setVideoLabelImage(m_localVideoLabel, m_lastLocalFrame);
+    setVideoLabelImage(m_remoteVideoLabel, m_lastRemoteFrame);
 }

@@ -5,6 +5,7 @@
 #include <QHash>
 #include <QImage>
 #include <QPointer>
+#include <QElapsedTimer>
 
 #include "model/chattypes.h"
 #include "model/peerinfo.h"
@@ -38,6 +39,10 @@ public:
     void acceptCall(const QString &peerId);
     void endCall(const QString &peerId);
     void sendVideoFrame(const QString &peerId, const QImage &frame);
+    void sendEncodedVideoFrame(const QString &peerId,
+                               const QByteArray &encodedFrame,
+                               const QString &imageFormat,
+                               const QSize &frameSize);
     void sendAudioChunk(const QString &peerId, const QByteArray &audioData, int sampleRate, int channelCount, int sampleFormat);
 
 signals:
@@ -94,4 +99,7 @@ private:
     QHash<QString, PeerConnection *> m_connectionsByPeerId;
     QHash<PeerConnection *, QString> m_peerIdsByConnection;
     QHash<QString, IncomingFile> m_incomingFiles;
+    QHash<QString, quint64> m_sentVideoFrames;
+    QHash<QString, quint64> m_receivedVideoFrames;
+    QElapsedTimer m_videoLogTimer;
 };
