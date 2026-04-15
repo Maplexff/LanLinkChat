@@ -3,6 +3,11 @@
 #include <QPainter>
 #include <QPaintEvent>
 
+VideoFrameWidget::VideoFrameWidget(QWidget *parent)
+    : VideoFrameWidget(QString(), parent)
+{
+}
+
 VideoFrameWidget::VideoFrameWidget(const QString &placeholderText, QWidget *parent)
     : QWidget(parent)
     , m_placeholderText(placeholderText)
@@ -25,6 +30,16 @@ void VideoFrameWidget::clearFrame()
     }
 
     m_frame = QImage();
+    update();
+}
+
+void VideoFrameWidget::setPlaceholderText(const QString &placeholderText)
+{
+    if (m_placeholderText == placeholderText) {
+        return;
+    }
+
+    m_placeholderText = placeholderText;
     update();
 }
 

@@ -1,4 +1,5 @@
 #include "mainwindow.h"
+#include "ui_mainwindow.h"
 
 #include <QAbstractItemView>
 #include <QAudioDevice>
@@ -14,32 +15,21 @@
 #include <QDialogButtonBox>
 #include <QFileDialog>
 #include <QFileInfo>
-#include <QFormLayout>
-#include <QComboBox>
-#include <QCheckBox>
-#include <QHBoxLayout>
 #include <QInputDialog>
-#include <QLabel>
-#include <QLineEdit>
-#include <QListWidget>
 #include <QListWidgetItem>
 #include <QMediaDevices>
 #include <QMessageBox>
 #include <QIODevice>
-#include <QPlainTextEdit>
-#include <QPushButton>
+#include <QKeySequence>
 #include <QSignalBlocker>
+#include <QShortcut>
 #include <QSettings>
-#include <QSplitter>
 #include <QStatusBar>
-#include <QTabWidget>
 #include <QTextOption>
 #include <QTimer>
-#include <QVBoxLayout>
 #include <QVideoFrame>
 #include <QVideoFrameFormat>
 #include <QVideoSink>
-#include <QWidget>
 
 #include <limits>
 
@@ -149,16 +139,6 @@ enum class PackedYuv422Order {
     YVYU,
     VYUY
 };
-
-enum VideoDecodeMode {
-    VideoDecodeAuto = 0,
-    VideoDecodeYUYV,
-    VideoDecodeUYVY,
-    VideoDecodeYVYU,
-    VideoDecodeVYUY
-};
-
-int g_videoDecodeMode = VideoDecodeAuto;
 
 QRgb yuvToRgb(int yValue, int uValue, int vValue)
 {
@@ -375,21 +355,6 @@ QImage convertPlanarYuv420FrameToImage(const QVideoFrame &frame, bool nv21Layout
 
 QImage frameToDisplayImage(const QVideoFrame &frame)
 {
-    if (frame.pixelFormat() == QVideoFrameFormat::Format_YUYV || frame.pixelFormat() == QVideoFrameFormat::Format_UYVY) {
-        switch (g_videoDecodeMode) {
-        case VideoDecodeYUYV:
-            return convertPackedYuv422FrameToImage(frame, PackedYuv422Order::YUYV).copy();
-        case VideoDecodeUYVY:
-            return convertPackedYuv422FrameToImage(frame, PackedYuv422Order::UYVY).copy();
-        case VideoDecodeYVYU:
-            return convertPackedYuv422FrameToImage(frame, PackedYuv422Order::YVYU).copy();
-        case VideoDecodeVYUY:
-            return convertPackedYuv422FrameToImage(frame, PackedYuv422Order::VYUY).copy();
-        default:
-            break;
-        }
-    }
-
     if (const QImage directImage = frame.toImage(); !directImage.isNull()) {
         const QImage rgbImage = directImage.convertToFormat(QImage::Format_RGB32);
         return rgbImage.isNull() ? QImage() : rgbImage.copy();
@@ -419,18 +384,6 @@ QImage frameToTransportImage(const QVideoFrame &frame, const QImage &displayImag
     switch (frame.pixelFormat()) {
     case QVideoFrameFormat::Format_YUYV:
     case QVideoFrameFormat::Format_UYVY:
-        switch (g_videoDecodeMode) {
-        case VideoDecodeYUYV:
-            return convertPackedYuv422FrameToImage(frame, PackedYuv422Order::YUYV).copy();
-        case VideoDecodeUYVY:
-            return convertPackedYuv422FrameToImage(frame, PackedYuv422Order::UYVY).copy();
-        case VideoDecodeYVYU:
-            return convertPackedYuv422FrameToImage(frame, PackedYuv422Order::YVYU).copy();
-        case VideoDecodeVYUY:
-            return convertPackedYuv422FrameToImage(frame, PackedYuv422Order::VYUY).copy();
-        default:
-            break;
-        }
         if (!displayImage.isNull()) {
             return bestPackedYuv422TransportImage(frame, displayImage);
         }
@@ -455,40 +408,35 @@ QImage frameToTransportImage(const QVideoFrame &frame, const QImage &displayImag
 
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)
+    , m_ui(new Ui::MainWindow)
     , m_manager(new PeerManager(this))
+    , m_mediaDevices(new QMediaDevices(this))
     , m_videoSink(new QVideoSink(this))
     , m_videoRefreshTimer(new QTimer(this))
 {
-    buildUi();
+    setupUi();
+    connectUi();
 
     QSettings settings;
     const QString savedName = settings.value(QStringLiteral("displayName"), m_manager->displayName()).toString();
-    m_nameEdit->setText(savedName);
+    m_ui->nameEdit->setText(savedName);
     m_manager->setDisplayName(savedName);
     populateCameraDevices();
 
     const QByteArray savedCameraId = settings.value(QStringLiteral("cameraDeviceId")).toByteArray();
-    if (m_cameraCombo) {
-        for (int index = 0; index < m_cameraCombo->count(); ++index) {
-            if (m_cameraCombo->itemData(index).toByteArray() == savedCameraId) {
-                m_cameraCombo->setCurrentIndex(index);
+    if (m_ui->cameraCombo) {
+        for (int index = 0; index < m_ui->cameraCombo->count(); ++index) {
+            if (m_ui->cameraCombo->itemData(index).toByteArray() == savedCameraId) {
+                m_ui->cameraCombo->setCurrentIndex(index);
                 break;
             }
         }
     }
-    if (m_receiveOnlyCheck) {
-        m_receiveOnlyCheck->setChecked(settings.value(QStringLiteral("receiveOnlyWithoutCamera"), true).toBool());
+    if (m_ui->receiveOnlyCheck) {
+        m_ui->receiveOnlyCheck->setChecked(settings.value(QStringLiteral("receiveOnlyWithoutCamera"), true).toBool());
     }
-    if (m_receiveRemoteVideoOnlyCheck) {
-        m_receiveRemoteVideoOnlyCheck->setChecked(settings.value(QStringLiteral("receiveRemoteVideoOnly"), false).toBool());
-    }
-    if (m_decodeModeCombo) {
-        const int decodeMode = settings.value(QStringLiteral("videoDecodeMode"), VideoDecodeAuto).toInt();
-        const int index = m_decodeModeCombo->findData(decodeMode);
-        if (index >= 0) {
-            m_decodeModeCombo->setCurrentIndex(index);
-            g_videoDecodeMode = decodeMode;
-        }
+    if (m_ui->receiveRemoteVideoOnlyCheck) {
+        m_ui->receiveRemoteVideoOnlyCheck->setChecked(settings.value(QStringLiteral("receiveRemoteVideoOnly"), false).toBool());
     }
 
     connect(m_manager, &PeerManager::peersChanged, this, &MainWindow::onPeersChanged);
@@ -504,6 +452,9 @@ MainWindow::MainWindow(QWidget *parent)
     connect(m_manager, &PeerManager::remoteAudioChunkReceived, this, &MainWindow::onRemoteAudioChunkReceived);
     connect(m_videoSink, &QVideoSink::videoFrameChanged, this, &MainWindow::processLocalFrame);
     connect(m_videoRefreshTimer, &QTimer::timeout, this, &MainWindow::flushVideoFrames);
+    connect(m_mediaDevices, &QMediaDevices::videoInputsChanged, this, &MainWindow::onVideoInputsChanged);
+    connect(m_mediaDevices, &QMediaDevices::audioInputsChanged, this, &MainWindow::onAudioInputsChanged);
+    connect(m_mediaDevices, &QMediaDevices::audioOutputsChanged, this, &MainWindow::onAudioOutputsChanged);
 
     m_videoRefreshTimer->setInterval(66);
     m_videoRefreshTimer->start();
@@ -519,6 +470,7 @@ MainWindow::MainWindow(QWidget *parent)
 MainWindow::~MainWindow()
 {
     stopCallMedia();
+    delete m_ui;
 }
 
 void MainWindow::resizeEvent(QResizeEvent *event)
@@ -527,11 +479,50 @@ void MainWindow::resizeEvent(QResizeEvent *event)
     refreshVideoLabels();
 }
 
+void MainWindow::setupUi()
+{
+    m_ui->setupUi(this);
+    m_ui->mainSplitter->setStretchFactor(1, 1);
+    m_ui->conversationTitle->setStyleSheet(QStringLiteral("font-size: 18px; font-weight: 600;"));
+    m_ui->callStatusLabel->setStyleSheet(QStringLiteral("font-size: 14px; font-weight: 500; padding: 2px 0;"));
+    m_ui->transcript->setWordWrapMode(QTextOption::WrapAtWordBoundaryOrAnywhere);
+    m_ui->messageEdit->setWordWrapMode(QTextOption::WrapAtWordBoundaryOrAnywhere);
+    m_ui->messageEdit->setMinimumHeight(96);
+    m_ui->chatVerticalSplitter->setChildrenCollapsible(false);
+    m_ui->chatVerticalSplitter->setStretchFactor(0, 1);
+    m_ui->chatVerticalSplitter->setStretchFactor(1, 0);
+    m_ui->chatVerticalSplitter->setSizes({560, 160});
+    m_ui->localVideoWidget->setPlaceholderText(QStringLiteral("本地画面"));
+    m_ui->remoteVideoWidget->setPlaceholderText(QStringLiteral("远端画面"));
+}
+
+void MainWindow::connectUi()
+{
+    connect(m_ui->nameApplyButton, &QPushButton::clicked, this, &MainWindow::applyDisplayName);
+    connect(m_ui->refreshPeersButton, &QPushButton::clicked, this, &MainWindow::triggerPeerDiscovery);
+    connect(m_ui->sendButton, &QPushButton::clicked, this, &MainWindow::sendTextMessage);
+    connect(m_ui->fileButton, &QPushButton::clicked, this, &MainWindow::sendFileToPeer);
+    connect(m_ui->groupButton, &QPushButton::clicked, this, &MainWindow::createGroup);
+    connect(m_ui->cameraApplyButton, &QPushButton::clicked, this, &MainWindow::applyCameraSelection);
+    connect(m_ui->receiveOnlyCheck, &QCheckBox::toggled, this, &MainWindow::applyReceiveOnlySetting);
+    connect(m_ui->receiveRemoteVideoOnlyCheck, &QCheckBox::toggled, this, &MainWindow::applyReceiveRemoteVideoOnlySetting);
+    connect(m_ui->videoButton, &QPushButton::clicked, this, &MainWindow::startVideoCall);
+    connect(m_ui->hangupButton, &QPushButton::clicked, this, &MainWindow::endVideoCall);
+    connect(m_ui->peerList, &QListWidget::currentItemChanged, this, &MainWindow::refreshConversationView);
+    connect(m_ui->groupList, &QListWidget::currentItemChanged, this, &MainWindow::refreshConversationView);
+    connect(m_ui->sidebarTabs, &QTabWidget::currentChanged, this, &MainWindow::refreshConversationView);
+
+    auto *sendShortcut = new QShortcut(QKeySequence(QStringLiteral("Ctrl+Return")), m_ui->messageEdit);
+    connect(sendShortcut, &QShortcut::activated, this, &MainWindow::sendTextMessage);
+    auto *sendShortcutNumPad = new QShortcut(QKeySequence(QStringLiteral("Ctrl+Enter")), m_ui->messageEdit);
+    connect(sendShortcutNumPad, &QShortcut::activated, this, &MainWindow::sendTextMessage);
+}
+
 void MainWindow::applyDisplayName()
 {
-    const QString name = m_nameEdit->text().trimmed();
+    const QString name = m_ui->nameEdit->text().trimmed();
     m_manager->setDisplayName(name);
-    m_nameEdit->setText(m_manager->displayName());
+    m_ui->nameEdit->setText(m_manager->displayName());
 
     QSettings settings;
     settings.setValue(QStringLiteral("displayName"), m_manager->displayName());
@@ -540,14 +531,14 @@ void MainWindow::applyDisplayName()
 
 void MainWindow::applyCameraSelection()
 {
-    if (!m_cameraCombo) {
+    if (!m_ui->cameraCombo) {
         return;
     }
 
     QSettings settings;
-    settings.setValue(QStringLiteral("cameraDeviceId"), m_cameraCombo->currentData().toByteArray());
+    settings.setValue(QStringLiteral("cameraDeviceId"), m_ui->cameraCombo->currentData().toByteArray());
 
-    const QString cameraName = m_cameraCombo->currentText().trimmed();
+    const QString cameraName = m_ui->cameraCombo->currentText().trimmed();
     if (m_camera) {
         stopCamera();
         if (!m_activeCallPeerId.isEmpty()) {
@@ -556,24 +547,6 @@ void MainWindow::applyCameraSelection()
     }
 
     statusBar()->showMessage(QStringLiteral("摄像头已切换为：%1").arg(cameraName.isEmpty() ? QStringLiteral("默认设备") : cameraName), 3000);
-}
-
-void MainWindow::applyVideoDecodeModeSelection()
-{
-    if (!m_decodeModeCombo) {
-        return;
-    }
-
-    const int decodeMode = m_decodeModeCombo->currentData().toInt();
-    g_videoDecodeMode = decodeMode;
-
-    QSettings settings;
-    settings.setValue(QStringLiteral("videoDecodeMode"), decodeMode);
-
-    m_pendingLocalFrame = QImage();
-    m_lastLocalFrame = QImage();
-    refreshVideoLabels();
-    statusBar()->showMessage(QStringLiteral("视频解码模式已更新。"), 3000);
 }
 
 void MainWindow::applyReceiveOnlySetting(bool enabled)
@@ -609,7 +582,7 @@ void MainWindow::triggerPeerDiscovery()
 
 void MainWindow::sendTextMessage()
 {
-    const QString text = m_messageEdit->text().trimmed();
+    const QString text = m_ui->messageEdit->toPlainText().trimmed();
     if (text.isEmpty()) {
         return;
     }
@@ -626,7 +599,7 @@ void MainWindow::sendTextMessage()
                           QStringLiteral("[%1] 我: %2").arg(timestampLabel(QDateTime::currentDateTime()), text));
     }
 
-    m_messageEdit->clear();
+    m_ui->messageEdit->clear();
     refreshConversationView();
 }
 
@@ -715,11 +688,11 @@ void MainWindow::startVideoCall()
     startAudioCapture();
     m_activeCallPeerId = peerId;
     m_manager->inviteToCall(peerId);
-    if (m_contentTabs) {
-        m_contentTabs->setCurrentIndex(1);
+    if (m_ui->contentTabs) {
+        m_ui->contentTabs->setCurrentIndex(1);
     }
-    if (m_callStatusLabel) {
-        m_callStatusLabel->setText(shouldSendLocalVideo()
+    if (m_ui->callStatusLabel) {
+        m_ui->callStatusLabel->setText(shouldSendLocalVideo()
                                        ? QStringLiteral("正在呼叫 %1").arg(peerName(peerId))
                                        : QStringLiteral("正在呼叫 %1（仅接收图像）").arg(peerName(peerId)));
     }
@@ -741,8 +714,8 @@ void MainWindow::endVideoCall()
     m_pendingRemoteFrame = QImage();
     m_pendingLocalFrame = QImage();
     refreshVideoLabels();
-    if (m_callStatusLabel) {
-        m_callStatusLabel->setText(QStringLiteral("未在通话中"));
+    if (m_ui->callStatusLabel) {
+        m_ui->callStatusLabel->setText(QStringLiteral("未在通话中"));
     }
     stopCallMedia();
     updateActionState();
@@ -750,25 +723,25 @@ void MainWindow::endVideoCall()
 
 void MainWindow::refreshConversationView()
 {
-    m_transcript->setPlainText(m_history.value(currentConversationKey()).join(QStringLiteral("\n")));
+    m_ui->transcript->setPlainText(m_history.value(currentConversationKey()).join(QStringLiteral("\n")));
 
     if (!currentPeerId().isEmpty()) {
-        m_conversationTitle->setText(QStringLiteral("单聊 - %1").arg(peerName(currentPeerId())));
+        m_ui->conversationTitle->setText(QStringLiteral("单聊 - %1").arg(peerName(currentPeerId())));
     } else if (!currentGroupId().isEmpty()) {
-        m_conversationTitle->setText(QStringLiteral("群聊 - %1").arg(groupName(currentGroupId())));
+        m_ui->conversationTitle->setText(QStringLiteral("群聊 - %1").arg(groupName(currentGroupId())));
     } else {
-        m_conversationTitle->setText(QStringLiteral("未选择会话"));
+        m_ui->conversationTitle->setText(QStringLiteral("未选择会话"));
     }
 
-    if (m_callStatusLabel) {
+    if (m_ui->callStatusLabel) {
         if (!m_activeCallPeerId.isEmpty()) {
-            m_callStatusLabel->setText(shouldSendLocalVideo()
+            m_ui->callStatusLabel->setText(shouldSendLocalVideo()
                                            ? QStringLiteral("正在与 %1 音视频通话").arg(peerName(m_activeCallPeerId))
                                            : QStringLiteral("正在与 %1 通话（仅接收图像）").arg(peerName(m_activeCallPeerId)));
         } else if (!currentPeerId().isEmpty()) {
-            m_callStatusLabel->setText(QStringLiteral("当前通话目标: %1").arg(peerName(currentPeerId())));
+            m_ui->callStatusLabel->setText(QStringLiteral("当前通话目标: %1").arg(peerName(currentPeerId())));
         } else {
-            m_callStatusLabel->setText(QStringLiteral("请选择一个联系人发起音视频通话"));
+            m_ui->callStatusLabel->setText(QStringLiteral("请选择一个联系人发起音视频通话"));
         }
     }
 
@@ -778,11 +751,11 @@ void MainWindow::refreshConversationView()
 void MainWindow::onPeersChanged(const QList<PeerInfo> &peers)
 {
     const QString selectedPeerId = currentPeerId();
-    const bool messageEditHadFocus = m_messageEdit->hasFocus();
+    const bool messageEditHadFocus = m_ui->messageEdit->hasFocus();
     m_peers.clear();
     {
-        const QSignalBlocker blocker(m_peerList);
-        m_peerList->clear();
+        const QSignalBlocker blocker(m_ui->peerList);
+        m_ui->peerList->clear();
 
         for (const PeerInfo &peer : peers) {
             m_peers.insert(peer.id, peer);
@@ -791,42 +764,42 @@ void MainWindow::onPeersChanged(const QList<PeerInfo> &peers)
                                                       peer.online ? QStringLiteral("[在线]") : QStringLiteral("[离线]"),
                                                       peer.address.toString(),
                                                       QString::number(peer.port)),
-                                             m_peerList);
+                                             m_ui->peerList);
             item->setData(Qt::UserRole, peer.id);
             if (peer.id == selectedPeerId) {
-                m_peerList->setCurrentItem(item);
+                m_ui->peerList->setCurrentItem(item);
             }
         }
     }
 
     refreshConversationView();
-    if (messageEditHadFocus && m_messageEdit->isEnabled()) {
-        m_messageEdit->setFocus();
+    if (messageEditHadFocus && m_ui->messageEdit->isEnabled()) {
+        m_ui->messageEdit->setFocus();
     }
 }
 
 void MainWindow::onGroupsChanged(const QList<GroupInfo> &groups)
 {
     const QString selectedGroupId = currentGroupId();
-    const bool messageEditHadFocus = m_messageEdit->hasFocus();
+    const bool messageEditHadFocus = m_ui->messageEdit->hasFocus();
     m_groups.clear();
     {
-        const QSignalBlocker blocker(m_groupList);
-        m_groupList->clear();
+        const QSignalBlocker blocker(m_ui->groupList);
+        m_ui->groupList->clear();
 
         for (const GroupInfo &group : groups) {
             m_groups.insert(group.id, group);
-            auto *item = new QListWidgetItem(QStringLiteral("%1 (%2人)").arg(group.name).arg(group.members.size()), m_groupList);
+            auto *item = new QListWidgetItem(QStringLiteral("%1 (%2人)").arg(group.name).arg(group.members.size()), m_ui->groupList);
             item->setData(Qt::UserRole, group.id);
             if (group.id == selectedGroupId) {
-                m_groupList->setCurrentItem(item);
+                m_ui->groupList->setCurrentItem(item);
             }
         }
     }
 
     refreshConversationView();
-    if (messageEditHadFocus && m_messageEdit->isEnabled()) {
-        m_messageEdit->setFocus();
+    if (messageEditHadFocus && m_ui->messageEdit->isEnabled()) {
+        m_ui->messageEdit->setFocus();
     }
 }
 
@@ -870,11 +843,11 @@ void MainWindow::onCallInvitationReceived(const QString &peerId)
         startAudioCapture();
         m_activeCallPeerId = peerId;
         m_manager->acceptCall(peerId);
-        if (m_contentTabs) {
-            m_contentTabs->setCurrentIndex(1);
+        if (m_ui->contentTabs) {
+            m_ui->contentTabs->setCurrentIndex(1);
         }
-        if (m_callStatusLabel) {
-            m_callStatusLabel->setText(shouldSendLocalVideo()
+        if (m_ui->callStatusLabel) {
+            m_ui->callStatusLabel->setText(shouldSendLocalVideo()
                                            ? QStringLiteral("正在与 %1 音视频通话").arg(peerName(peerId))
                                            : QStringLiteral("正在与 %1 通话（仅接收图像）").arg(peerName(peerId)));
         }
@@ -892,11 +865,11 @@ void MainWindow::onCallAccepted(const QString &peerId)
         return;
     }
     startAudioCapture();
-    if (m_contentTabs) {
-        m_contentTabs->setCurrentIndex(1);
+    if (m_ui->contentTabs) {
+        m_ui->contentTabs->setCurrentIndex(1);
     }
-    if (m_callStatusLabel) {
-        m_callStatusLabel->setText(shouldSendLocalVideo()
+    if (m_ui->callStatusLabel) {
+        m_ui->callStatusLabel->setText(shouldSendLocalVideo()
                                        ? QStringLiteral("正在与 %1 音视频通话").arg(peerName(peerId))
                                        : QStringLiteral("正在与 %1 通话（仅接收图像）").arg(peerName(peerId)));
     }
@@ -913,8 +886,8 @@ void MainWindow::onCallEnded(const QString &peerId)
         m_pendingRemoteFrame = QImage();
         m_pendingLocalFrame = QImage();
         refreshVideoLabels();
-        if (m_callStatusLabel) {
-            m_callStatusLabel->setText(QStringLiteral("未在通话中"));
+        if (m_ui->callStatusLabel) {
+            m_ui->callStatusLabel->setText(QStringLiteral("未在通话中"));
         }
         stopCallMedia();
     }
@@ -926,14 +899,14 @@ void MainWindow::onRemoteVideoFrameReceived(const QString &peerId, const QImage 
 {
     if (m_activeCallPeerId.isEmpty()) {
         m_activeCallPeerId = peerId;
-        if (m_contentTabs) {
-            m_contentTabs->setCurrentIndex(1);
+        if (m_ui->contentTabs) {
+            m_ui->contentTabs->setCurrentIndex(1);
         }
     }
     if (m_activeCallPeerId == peerId) {
         m_pendingRemoteFrame = frame;
-        if (m_callStatusLabel) {
-            m_callStatusLabel->setText(shouldSendLocalVideo()
+        if (m_ui->callStatusLabel) {
+            m_ui->callStatusLabel->setText(shouldSendLocalVideo()
                                            ? QStringLiteral("正在与 %1 音视频通话").arg(peerName(peerId))
                                            : QStringLiteral("正在与 %1 通话（仅接收图像）").arg(peerName(peerId)));
         }
@@ -1032,13 +1005,13 @@ void MainWindow::flushVideoFrames()
     if (!m_pendingLocalFrame.isNull()) {
         m_lastLocalFrame = m_pendingLocalFrame;
         m_pendingLocalFrame = QImage();
-        setVideoLabelImage(m_localVideoLabel, m_lastLocalFrame);
+        setVideoLabelImage(m_ui->localVideoWidget, m_lastLocalFrame);
     }
 
     if (!m_pendingRemoteFrame.isNull()) {
         m_lastRemoteFrame = m_pendingRemoteFrame;
         m_pendingRemoteFrame = QImage();
-        setVideoLabelImage(m_remoteVideoLabel, m_lastRemoteFrame);
+        setVideoLabelImage(m_ui->remoteVideoWidget, m_lastRemoteFrame);
     }
 }
 
@@ -1048,146 +1021,12 @@ void MainWindow::updateActionState()
     const bool hasGroup = !currentGroupId().isEmpty();
     const bool hasConversation = hasPeer || hasGroup;
 
-    m_sendButton->setEnabled(hasConversation);
-    m_messageEdit->setEnabled(hasConversation);
-    m_fileButton->setEnabled(hasPeer);
-    m_videoButton->setEnabled(hasPeer && m_activeCallPeerId.isEmpty());
-    m_hangupButton->setEnabled(!m_activeCallPeerId.isEmpty());
-}
+    m_ui->sendButton->setEnabled(hasConversation);
+    m_ui->messageEdit->setEnabled(hasConversation);
+    m_ui->fileButton->setEnabled(hasPeer);
+    m_ui->videoButton->setEnabled(hasPeer && m_activeCallPeerId.isEmpty());
+    m_ui->hangupButton->setEnabled(!m_activeCallPeerId.isEmpty());
 
-void MainWindow::buildUi()
-{
-    auto *central = new QWidget(this);
-    auto *rootLayout = new QHBoxLayout(central);
-    auto *splitter = new QSplitter(Qt::Horizontal, central);
-    rootLayout->addWidget(splitter);
-
-    auto *sidebar = new QWidget(splitter);
-    auto *sidebarLayout = new QVBoxLayout(sidebar);
-
-    auto *nameRow = new QHBoxLayout();
-    m_nameEdit = new QLineEdit(sidebar);
-    m_nameEdit->setPlaceholderText(QStringLiteral("我的显示名"));
-    auto *nameButton = new QPushButton(QStringLiteral("更新"), sidebar);
-    nameRow->addWidget(m_nameEdit);
-    nameRow->addWidget(nameButton);
-
-    m_groupButton = new QPushButton(QStringLiteral("创建群聊"), sidebar);
-    m_refreshPeersButton = new QPushButton(QStringLiteral("手动发现"), sidebar);
-    m_sidebarTabs = new QTabWidget(sidebar);
-    m_peerList = new QListWidget(m_sidebarTabs);
-    m_groupList = new QListWidget(m_sidebarTabs);
-    m_sidebarTabs->addTab(m_peerList, QStringLiteral("联系人"));
-    m_sidebarTabs->addTab(m_groupList, QStringLiteral("群聊"));
-
-    sidebarLayout->addLayout(nameRow);
-    sidebarLayout->addWidget(m_groupButton);
-    sidebarLayout->addWidget(m_refreshPeersButton);
-    sidebarLayout->addWidget(m_sidebarTabs);
-
-    auto *content = new QWidget(splitter);
-    auto *contentLayout = new QVBoxLayout(content);
-
-    m_contentTabs = new QTabWidget(content);
-
-    auto *chatPage = new QWidget(m_contentTabs);
-    auto *chatLayout = new QVBoxLayout(chatPage);
-    m_conversationTitle = new QLabel(QStringLiteral("未选择会话"), chatPage);
-    m_conversationTitle->setStyleSheet(QStringLiteral("font-size: 18px; font-weight: 600;"));
-
-    m_transcript = new QPlainTextEdit(chatPage);
-    m_transcript->setReadOnly(true);
-    m_transcript->setWordWrapMode(QTextOption::WrapAtWordBoundaryOrAnywhere);
-
-    auto *chatActionRow = new QHBoxLayout();
-    m_fileButton = new QPushButton(QStringLiteral("发送文件"), chatPage);
-    chatActionRow->addWidget(m_fileButton);
-    chatActionRow->addStretch();
-
-    auto *messageRow = new QHBoxLayout();
-    m_messageEdit = new QLineEdit(chatPage);
-    m_messageEdit->setPlaceholderText(QStringLiteral("输入消息内容"));
-    m_sendButton = new QPushButton(QStringLiteral("发送"), chatPage);
-    messageRow->addWidget(m_messageEdit);
-    messageRow->addWidget(m_sendButton);
-
-    chatLayout->addWidget(m_conversationTitle);
-    chatLayout->addWidget(m_transcript, 1);
-    chatLayout->addLayout(chatActionRow);
-    chatLayout->addLayout(messageRow);
-
-    auto *callPage = new QWidget(m_contentTabs);
-    auto *callLayout = new QVBoxLayout(callPage);
-    m_callStatusLabel = new QLabel(QStringLiteral("请选择一个联系人发起音视频通话"), callPage);
-    m_callStatusLabel->setStyleSheet(QStringLiteral("font-size: 18px; font-weight: 600;"));
-
-    auto *cameraRow = new QHBoxLayout();
-    auto *cameraLabel = new QLabel(QStringLiteral("摄像头"), callPage);
-    m_cameraCombo = new QComboBox(callPage);
-    m_cameraApplyButton = new QPushButton(QStringLiteral("应用设备"), callPage);
-    m_receiveOnlyCheck = new QCheckBox(QStringLiteral("无摄像头时仅接收"), callPage);
-    m_receiveRemoteVideoOnlyCheck = new QCheckBox(QStringLiteral("仅接收图像"), callPage);
-    auto *decodeModeLabel = new QLabel(QStringLiteral("解码"), callPage);
-    m_decodeModeCombo = new QComboBox(callPage);
-    m_decodeModeApplyButton = new QPushButton(QStringLiteral("应用解码"), callPage);
-    m_decodeModeCombo->addItem(QStringLiteral("自动(Qt)"), VideoDecodeAuto);
-    m_decodeModeCombo->addItem(QStringLiteral("YUYV"), VideoDecodeYUYV);
-    m_decodeModeCombo->addItem(QStringLiteral("UYVY"), VideoDecodeUYVY);
-    m_decodeModeCombo->addItem(QStringLiteral("YVYU"), VideoDecodeYVYU);
-    m_decodeModeCombo->addItem(QStringLiteral("VYUY"), VideoDecodeVYUY);
-    cameraRow->addWidget(cameraLabel);
-    cameraRow->addWidget(m_cameraCombo, 1);
-    cameraRow->addWidget(m_cameraApplyButton);
-    cameraRow->addWidget(decodeModeLabel);
-    cameraRow->addWidget(m_decodeModeCombo);
-    cameraRow->addWidget(m_decodeModeApplyButton);
-    cameraRow->addWidget(m_receiveOnlyCheck);
-    cameraRow->addWidget(m_receiveRemoteVideoOnlyCheck);
-
-    auto *videoRow = new QHBoxLayout();
-    m_localVideoLabel = new VideoFrameWidget(QStringLiteral("本地画面"), callPage);
-    m_remoteVideoLabel = new VideoFrameWidget(QStringLiteral("远端画面"), callPage);
-    videoRow->addWidget(m_localVideoLabel);
-    videoRow->addWidget(m_remoteVideoLabel);
-
-    auto *callActionRow = new QHBoxLayout();
-    m_videoButton = new QPushButton(QStringLiteral("发起音视频"), callPage);
-    m_hangupButton = new QPushButton(QStringLiteral("挂断"), callPage);
-    callActionRow->addWidget(m_videoButton);
-    callActionRow->addWidget(m_hangupButton);
-    callActionRow->addStretch();
-
-    callLayout->addWidget(m_callStatusLabel);
-    callLayout->addLayout(cameraRow);
-    callLayout->addLayout(videoRow, 1);
-    callLayout->addLayout(callActionRow);
-
-    m_contentTabs->addTab(chatPage, QStringLiteral("聊天"));
-    m_contentTabs->addTab(callPage, QStringLiteral("音视频"));
-    contentLayout->addWidget(m_contentTabs);
-
-    splitter->addWidget(sidebar);
-    splitter->addWidget(content);
-    splitter->setStretchFactor(1, 1);
-    setCentralWidget(central);
-
-    connect(nameButton, &QPushButton::clicked, this, &MainWindow::applyDisplayName);
-    connect(m_refreshPeersButton, &QPushButton::clicked, this, &MainWindow::triggerPeerDiscovery);
-    connect(m_sendButton, &QPushButton::clicked, this, &MainWindow::sendTextMessage);
-    connect(m_messageEdit, &QLineEdit::returnPressed, this, &MainWindow::sendTextMessage);
-    connect(m_fileButton, &QPushButton::clicked, this, &MainWindow::sendFileToPeer);
-    connect(m_groupButton, &QPushButton::clicked, this, &MainWindow::createGroup);
-    connect(m_cameraApplyButton, &QPushButton::clicked, this, &MainWindow::applyCameraSelection);
-    connect(m_decodeModeApplyButton, &QPushButton::clicked, this, &MainWindow::applyVideoDecodeModeSelection);
-    connect(m_receiveOnlyCheck, &QCheckBox::toggled, this, &MainWindow::applyReceiveOnlySetting);
-    connect(m_receiveRemoteVideoOnlyCheck, &QCheckBox::toggled, this, &MainWindow::applyReceiveRemoteVideoOnlySetting);
-    connect(m_videoButton, &QPushButton::clicked, this, &MainWindow::startVideoCall);
-    connect(m_hangupButton, &QPushButton::clicked, this, &MainWindow::endVideoCall);
-    connect(m_peerList, &QListWidget::currentItemChanged, this, &MainWindow::refreshConversationView);
-    connect(m_groupList, &QListWidget::currentItemChanged, this, &MainWindow::refreshConversationView);
-    connect(m_sidebarTabs, &QTabWidget::currentChanged, this, &MainWindow::refreshConversationView);
-
-    updateActionState();
 }
 
 void MainWindow::appendHistoryLine(const QString &conversationKey, const QString &line)
@@ -1200,35 +1039,35 @@ void MainWindow::appendHistoryLine(const QString &conversationKey, const QString
 
 void MainWindow::populateCameraDevices()
 {
-    if (!m_cameraCombo) {
+    if (!m_ui->cameraCombo) {
         return;
     }
 
-    const QByteArray previousId = m_cameraCombo->currentData().toByteArray();
-    m_cameraCombo->clear();
+    const QByteArray previousId = m_ui->cameraCombo->currentData().toByteArray();
+    m_ui->cameraCombo->clear();
 
     const QList<QCameraDevice> devices = QMediaDevices::videoInputs();
     for (const QCameraDevice &device : devices) {
-        m_cameraCombo->addItem(device.description(), device.id());
+        m_ui->cameraCombo->addItem(device.description(), device.id());
     }
 
-    if (m_cameraCombo->count() == 0) {
-        m_cameraCombo->addItem(QStringLiteral("未检测到摄像头"), QByteArray());
-        m_cameraCombo->setEnabled(false);
-        if (m_cameraApplyButton) {
-            m_cameraApplyButton->setEnabled(false);
+    if (m_ui->cameraCombo->count() == 0) {
+        m_ui->cameraCombo->addItem(QStringLiteral("未检测到摄像头"), QByteArray());
+        m_ui->cameraCombo->setEnabled(false);
+        if (m_ui->cameraApplyButton) {
+            m_ui->cameraApplyButton->setEnabled(false);
         }
         return;
     }
 
-    m_cameraCombo->setEnabled(true);
-    if (m_cameraApplyButton) {
-        m_cameraApplyButton->setEnabled(true);
+    m_ui->cameraCombo->setEnabled(true);
+    if (m_ui->cameraApplyButton) {
+        m_ui->cameraApplyButton->setEnabled(true);
     }
 
-    for (int index = 0; index < m_cameraCombo->count(); ++index) {
-        if (m_cameraCombo->itemData(index).toByteArray() == previousId) {
-            m_cameraCombo->setCurrentIndex(index);
+    for (int index = 0; index < m_ui->cameraCombo->count(); ++index) {
+        if (m_ui->cameraCombo->itemData(index).toByteArray() == previousId) {
+            m_ui->cameraCombo->setCurrentIndex(index);
             return;
         }
     }
@@ -1236,18 +1075,18 @@ void MainWindow::populateCameraDevices()
 
 QString MainWindow::currentPeerId() const
 {
-    if (m_sidebarTabs->currentWidget() != m_peerList || !m_peerList->currentItem()) {
+    if (m_ui->sidebarTabs->currentWidget() != m_ui->peersTab || !m_ui->peerList->currentItem()) {
         return {};
     }
-    return m_peerList->currentItem()->data(Qt::UserRole).toString();
+    return m_ui->peerList->currentItem()->data(Qt::UserRole).toString();
 }
 
 QString MainWindow::currentGroupId() const
 {
-    if (m_sidebarTabs->currentWidget() != m_groupList || !m_groupList->currentItem()) {
+    if (m_ui->sidebarTabs->currentWidget() != m_ui->groupsTab || !m_ui->groupList->currentItem()) {
         return {};
     }
-    return m_groupList->currentItem()->data(Qt::UserRole).toString();
+    return m_ui->groupList->currentItem()->data(Qt::UserRole).toString();
 }
 
 QString MainWindow::currentConversationKey() const
@@ -1274,7 +1113,7 @@ QString MainWindow::groupName(const QString &groupId) const
 QCameraDevice MainWindow::selectedCameraDevice() const
 {
     const QList<QCameraDevice> devices = QMediaDevices::videoInputs();
-    const QByteArray selectedId = m_cameraCombo ? m_cameraCombo->currentData().toByteArray() : QByteArray();
+    const QByteArray selectedId = m_ui->cameraCombo ? m_ui->cameraCombo->currentData().toByteArray() : QByteArray();
 
     for (const QCameraDevice &device : devices) {
         if (!selectedId.isEmpty() && device.id() == selectedId) {
@@ -1287,11 +1126,11 @@ QCameraDevice MainWindow::selectedCameraDevice() const
 
 void MainWindow::selectGroup(const QString &groupId)
 {
-    m_sidebarTabs->setCurrentWidget(m_groupList);
-    for (int row = 0; row < m_groupList->count(); ++row) {
-        QListWidgetItem *item = m_groupList->item(row);
+    m_ui->sidebarTabs->setCurrentWidget(m_ui->groupsTab);
+    for (int row = 0; row < m_ui->groupList->count(); ++row) {
+        QListWidgetItem *item = m_ui->groupList->item(row);
         if (item->data(Qt::UserRole).toString() == groupId) {
-            m_groupList->setCurrentItem(item);
+            m_ui->groupList->setCurrentItem(item);
             break;
         }
     }
@@ -1310,6 +1149,8 @@ bool MainWindow::ensureCameraRunning()
     }
 
     m_camera = new QCamera(cameraDevice, this);
+    connect(m_camera, &QCamera::errorOccurred, this, &MainWindow::onCameraErrorOccurred);
+    connect(m_camera, &QCamera::activeChanged, this, &MainWindow::onCameraActiveChanged);
     if (!cameraDevice.videoFormats().isEmpty()) {
         qInfo() << "Available camera formats for" << cameraDevice.description() << ":";
         for (const QCameraFormat &candidate : cameraDevice.videoFormats()) {
@@ -1336,6 +1177,11 @@ bool MainWindow::ensureCameraRunning()
     m_captureSession.setVideoSink(m_videoSink);
     m_camera->start();
 
+    if (m_camera->error() != QCamera::NoError) {
+        reportCameraIssue(QStringLiteral("摄像头启动失败：%1").arg(m_camera->errorString()), true);
+        return false;
+    }
+
     const QCameraFormat activeFormat = m_camera->cameraFormat();
     qInfo().nospace()
         << "Active camera format for " << cameraDevice.description()
@@ -1357,7 +1203,7 @@ bool MainWindow::prepareCallCamera()
         return true;
     }
 
-    const bool receiveOnlyEnabled = m_receiveOnlyCheck && m_receiveOnlyCheck->isChecked();
+    const bool receiveOnlyEnabled = m_ui->receiveOnlyCheck && m_ui->receiveOnlyCheck->isChecked();
     if (!receiveOnlyEnabled) {
         QMessageBox::warning(this, QStringLiteral("摄像头不可用"), QStringLiteral("当前系统没有检测到可用摄像头。"));
         return false;
@@ -1366,8 +1212,8 @@ bool MainWindow::prepareCallCamera()
     QMessageBox::information(this,
                              QStringLiteral("仅接收模式"),
                              QStringLiteral("当前没有可用摄像头，将继续通话并仅接收对端画面，本地不会发送视频。"));
-    if (m_callStatusLabel && !m_activeCallPeerId.isEmpty()) {
-        m_callStatusLabel->setText(QStringLiteral("正在与 %1 音视频通话（仅接收视频）").arg(peerName(m_activeCallPeerId)));
+    if (m_ui->callStatusLabel && !m_activeCallPeerId.isEmpty()) {
+        m_ui->callStatusLabel->setText(QStringLiteral("正在与 %1 音视频通话（仅接收视频）").arg(peerName(m_activeCallPeerId)));
     }
     statusBar()->showMessage(QStringLiteral("当前没有可用摄像头，已切换到仅接收模式。"), 4000);
     return true;
@@ -1375,12 +1221,7 @@ bool MainWindow::prepareCallCamera()
 
 bool MainWindow::shouldSendLocalVideo() const
 {
-    return !(m_receiveRemoteVideoOnlyCheck && m_receiveRemoteVideoOnlyCheck->isChecked());
-}
-
-int MainWindow::selectedVideoDecodeMode() const
-{
-    return m_decodeModeCombo ? m_decodeModeCombo->currentData().toInt() : VideoDecodeAuto;
+    return !(m_ui->receiveRemoteVideoOnlyCheck && m_ui->receiveRemoteVideoOnlyCheck->isChecked());
 }
 
 bool MainWindow::startAudioCapture()
@@ -1409,11 +1250,12 @@ bool MainWindow::startAudioCapture()
 
     m_audioSource = new QAudioSource(inputDevice, m_audioInputFormat, this);
     m_audioSource->setBufferSize(16 * 1024);
+    connect(m_audioSource, &QAudioSource::stateChanged, this, &MainWindow::onAudioSourceStateChanged);
     m_audioInputDevice = m_audioSource->start();
     if (!m_audioInputDevice) {
         delete m_audioSource;
         m_audioSource = nullptr;
-        statusBar()->showMessage(QStringLiteral("麦克风启动失败，将仅发送视频。"), 4000);
+        reportAudioInputIssue(QStringLiteral("麦克风启动失败，将仅发送视频。"));
         return false;
     }
 
@@ -1443,11 +1285,12 @@ bool MainWindow::ensureAudioPlayback(const QAudioFormat &format)
     m_audioOutputFormat = format;
     m_audioSink = new QAudioSink(outputDevice, m_audioOutputFormat, this);
     m_audioSink->setBufferSize(32 * 1024);
+    connect(m_audioSink, &QAudioSink::stateChanged, this, &MainWindow::onAudioSinkStateChanged);
     m_audioOutputDevice = m_audioSink->start();
     if (!m_audioOutputDevice) {
         delete m_audioSink;
         m_audioSink = nullptr;
-        statusBar()->showMessage(QStringLiteral("扬声器启动失败，无法播放对端语音。"), 4000);
+        reportAudioOutputIssue(QStringLiteral("扬声器启动失败，无法播放对端语音。"));
         return false;
     }
 
@@ -1522,6 +1365,98 @@ void MainWindow::setVideoLabelImage(VideoFrameWidget *widget, const QImage &imag
 
 void MainWindow::refreshVideoLabels()
 {
-    setVideoLabelImage(m_localVideoLabel, m_lastLocalFrame);
-    setVideoLabelImage(m_remoteVideoLabel, m_lastRemoteFrame);
+    setVideoLabelImage(m_ui->localVideoWidget, m_lastLocalFrame);
+    setVideoLabelImage(m_ui->remoteVideoWidget, m_lastRemoteFrame);
+}
+
+void MainWindow::reportCameraIssue(const QString &message, bool showDialog)
+{
+    statusBar()->showMessage(message, 5000);
+    qWarning() << message;
+
+    if (!showDialog || m_cameraErrorDialogVisible) {
+        return;
+    }
+
+    m_cameraErrorDialogVisible = true;
+    QMessageBox::warning(this, QStringLiteral("摄像头异常"), message);
+    m_cameraErrorDialogVisible = false;
+}
+
+void MainWindow::reportAudioInputIssue(const QString &message)
+{
+    statusBar()->showMessage(message, 5000);
+    qWarning() << message;
+}
+
+void MainWindow::reportAudioOutputIssue(const QString &message)
+{
+    statusBar()->showMessage(message, 5000);
+    qWarning() << message;
+}
+
+void MainWindow::onVideoInputsChanged()
+{
+    const QByteArray currentId = m_ui->cameraCombo ? m_ui->cameraCombo->currentData().toByteArray() : QByteArray();
+    populateCameraDevices();
+
+    if (!currentId.isEmpty() && selectedCameraDevice().isNull()) {
+        reportCameraIssue(QStringLiteral("当前选择的摄像头已不可用，请重新选择设备。"), true);
+        stopCamera();
+    } else {
+        statusBar()->showMessage(QStringLiteral("摄像头设备列表已更新。"), 3000);
+    }
+}
+
+void MainWindow::onAudioInputsChanged()
+{
+    statusBar()->showMessage(QStringLiteral("麦克风设备列表已更新。"), 3000);
+}
+
+void MainWindow::onAudioOutputsChanged()
+{
+    statusBar()->showMessage(QStringLiteral("扬声器设备列表已更新。"), 3000);
+}
+
+void MainWindow::onCameraErrorOccurred()
+{
+    if (!m_camera) {
+        return;
+    }
+
+    reportCameraIssue(QStringLiteral("摄像头错误：%1").arg(m_camera->errorString()), true);
+}
+
+void MainWindow::onCameraActiveChanged(bool active)
+{
+    if (active) {
+        statusBar()->showMessage(QStringLiteral("摄像头已启动。"), 2000);
+        return;
+    }
+
+    if (m_camera && m_camera->error() == QCamera::NoError && shouldSendLocalVideo() && !m_activeCallPeerId.isEmpty()) {
+        reportCameraIssue(QStringLiteral("摄像头已停止工作，本地视频发送已中断。"), false);
+    }
+}
+
+void MainWindow::onAudioSourceStateChanged()
+{
+    if (!m_audioSource) {
+        return;
+    }
+
+    if (m_audioSource->error() != QtAudio::NoError) {
+        reportAudioInputIssue(QStringLiteral("麦克风异常，错误码：%1").arg(static_cast<int>(m_audioSource->error())));
+    }
+}
+
+void MainWindow::onAudioSinkStateChanged()
+{
+    if (!m_audioSink) {
+        return;
+    }
+
+    if (m_audioSink->error() != QtAudio::NoError) {
+        reportAudioOutputIssue(QStringLiteral("扬声器异常，错误码：%1").arg(static_cast<int>(m_audioSink->error())));
+    }
 }

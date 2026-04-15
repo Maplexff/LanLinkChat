@@ -30,6 +30,7 @@ qt_add_executable(LanLinkChat
     src/network/protocol.h
     src/ui/mainwindow.cpp
     src/ui/mainwindow.h
+    src/ui/mainwindow.ui
     src/ui/videoframewidget.cpp
     src/ui/videoframewidget.h
 )

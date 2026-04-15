@@ -24,6 +24,9 @@ HEADERS += \
     src/ui/mainwindow.h \
     src/ui/videoframewidget.h
 
+FORMS += \
+    src/ui/mainwindow.ui
+
 INCLUDEPATH += $$PWD/src
 
 win32:CONFIG(release, debug|release): DESTDIR = $$PWD/bin/release

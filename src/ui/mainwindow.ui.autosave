@@ -1,0 +1,262 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+ <class>MainWindow</class>
+ <widget class="QMainWindow" name="MainWindow">
+  <property name="geometry">
+   <rect>
+    <x>0</x>
+    <y>0</y>
+    <width>1280</width>
+    <height>820</height>
+   </rect>
+  </property>
+  <property name="windowTitle">
+   <string>LanLinkChat - 局域网聊天</string>
+  </property>
+  <widget class="QWidget" name="centralwidget">
+   <layout class="QHBoxLayout" name="horizontalLayout">
+    <item>
+     <widget class="QSplitter" name="mainSplitter">
+      <property name="orientation">
+       <enum>Qt::Orientation::Horizontal</enum>
+      </property>
+      <widget class="QWidget" name="sidebarWidget">
+       <layout class="QVBoxLayout" name="sidebarLayout">
+        <item>
+         <layout class="QHBoxLayout" name="nameRowLayout">
+          <item>
+           <widget class="QLineEdit" name="nameEdit">
+            <property name="placeholderText">
+             <string>我的显示名</string>
+            </property>
+           </widget>
+          </item>
+          <item>
+           <widget class="QPushButton" name="nameApplyButton">
+            <property name="text">
+             <string>更新</string>
+            </property>
+           </widget>
+          </item>
+         </layout>
+        </item>
+        <item>
+         <widget class="QPushButton" name="groupButton">
+          <property name="text">
+           <string>创建群聊</string>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QPushButton" name="refreshPeersButton">
+          <property name="text">
+           <string>手动发现</string>
+          </property>
+         </widget>
+        </item>
+        <item>
+         <widget class="QTabWidget" name="sidebarTabs">
+          <widget class="QWidget" name="peersTab">
+           <attribute name="title">
+            <string>联系人</string>
+           </attribute>
+           <layout class="QVBoxLayout" name="peersTabLayout">
+            <item>
+             <widget class="QListWidget" name="peerList"/>
+            </item>
+           </layout>
+          </widget>
+          <widget class="QWidget" name="groupsTab">
+           <attribute name="title">
+            <string>群聊</string>
+           </attribute>
+           <layout class="QVBoxLayout" name="groupsTabLayout">
+            <item>
+             <widget class="QListWidget" name="groupList"/>
+            </item>
+           </layout>
+          </widget>
+         </widget>
+        </item>
+       </layout>
+      </widget>
+      <widget class="QWidget" name="contentWidget">
+       <layout class="QVBoxLayout" name="contentLayout">
+        <item>
+         <widget class="QTabWidget" name="contentTabs">
+          <property name="currentIndex">
+           <number>1</number>
+          </property>
+          <widget class="QWidget" name="chatPage">
+           <attribute name="title">
+            <string>聊天</string>
+           </attribute>
+           <layout class="QVBoxLayout" name="chatLayout">
+            <item>
+             <widget class="QLabel" name="conversationTitle">
+              <property name="text">
+               <string>未选择会话</string>
+              </property>
+             </widget>
+            </item>
+            <item>
+             <widget class="QPlainTextEdit" name="transcript">
+              <property name="readOnly">
+               <bool>true</bool>
+              </property>
+             </widget>
+            </item>
+            <item>
+             <layout class="QHBoxLayout" name="chatActionRowLayout">
+              <item>
+               <widget class="QPushButton" name="fileButton">
+                <property name="text">
+                 <string>发送文件</string>
+                </property>
+               </widget>
+              </item>
+              <item>
+               <spacer name="chatActionSpacer">
+                <property name="orientation">
+                 <enum>Qt::Orientation::Horizontal</enum>
+                </property>
+                <property name="sizeHint" stdset="0">
+                 <size>
+                  <width>40</width>
+                  <height>20</height>
+                 </size>
+                </property>
+               </spacer>
+              </item>
+             </layout>
+            </item>
+            <item>
+             <layout class="QHBoxLayout" name="messageRowLayout">
+              <item>
+               <widget class="QLineEdit" name="messageEdit">
+                <property name="placeholderText">
+                 <string>输入消息内容</string>
+                </property>
+               </widget>
+              </item>
+              <item>
+               <widget class="QPushButton" name="sendButton">
+                <property name="text">
+                 <string>发送</string>
+                </property>
+               </widget>
+              </item>
+             </layout>
+            </item>
+           </layout>
+          </widget>
+          <widget class="QWidget" name="callPage">
+           <attribute name="title">
+            <string>音视频</string>
+           </attribute>
+           <layout class="QVBoxLayout" name="callLayout">
+            <item>
+             <widget class="QLabel" name="callStatusLabel">
+              <property name="text">
+               <string>请选择一个联系人发起音视频通话</string>
+              </property>
+             </widget>
+            </item>
+            <item>
+             <layout class="QHBoxLayout" name="cameraRowLayout">
+              <item>
+               <widget class="QLabel" name="cameraLabel">
+                <property name="text">
+                 <string>摄像头</string>
+                </property>
+               </widget>
+              </item>
+              <item>
+               <widget class="QComboBox" name="cameraCombo"/>
+              </item>
+              <item>
+               <widget class="QPushButton" name="cameraApplyButton">
+                <property name="text">
+                 <string>应用设备</string>
+                </property>
+               </widget>
+              </item>
+              <item>
+               <widget class="QCheckBox" name="receiveOnlyCheck">
+                <property name="text">
+                 <string>无摄像头时仅接收</string>
+                </property>
+               </widget>
+              </item>
+              <item>
+               <widget class="QCheckBox" name="receiveRemoteVideoOnlyCheck">
+                <property name="text">
+                 <string>仅接收图像</string>
+                </property>
+               </widget>
+              </item>
+             </layout>
+            </item>
+            <item>
+             <layout class="QHBoxLayout" name="videoRowLayout">
+              <item>
+               <widget class="VideoFrameWidget" name="localVideoWidget" native="true"/>
+              </item>
+              <item>
+               <widget class="VideoFrameWidget" name="remoteVideoWidget" native="true"/>
+              </item>
+             </layout>
+            </item>
+            <item>
+             <layout class="QHBoxLayout" name="callActionRowLayout">
+              <item>
+               <widget class="QPushButton" name="videoButton">
+                <property name="text">
+                 <string>发起音视频</string>
+                </property>
+               </widget>
+              </item>
+              <item>
+               <widget class="QPushButton" name="hangupButton">
+                <property name="text">
+                 <string>挂断</string>
+                </property>
+               </widget>
+              </item>
+              <item>
+               <spacer name="callActionSpacer">
+                <property name="orientation">
+                 <enum>Qt::Orientation::Horizontal</enum>
+                </property>
+                <property name="sizeHint" stdset="0">
+                 <size>
+                  <width>40</width>
+                  <height>20</height>
+                 </size>
+                </property>
+               </spacer>
+              </item>
+             </layout>
+            </item>
+           </layout>
+          </widget>
+         </widget>
+        </item>
+       </layout>
+      </widget>
+     </widget>
+    </item>
+   </layout>
+  </widget>
+  <widget class="QStatusBar" name="statusbar"/>
+ </widget>
+ <customwidgets>
+  <customwidget>
+   <class>VideoFrameWidget</class>
+   <extends>QWidget</extends>
+   <header>ui/videoframewidget.h</header>
+  </customwidget>
+ </customwidgets>
+ <resources/>
+ <connections/>
+</ui>
