@@ -204,9 +204,33 @@
                <widget class="QComboBox" name="cameraCombo"/>
               </item>
               <item>
+               <widget class="QLabel" name="cameraFormatLabel">
+                <property name="text">
+                 <string>分辨率</string>
+                </property>
+               </widget>
+              </item>
+              <item>
+               <widget class="QComboBox" name="cameraFormatCombo"/>
+              </item>
+              <item>
                <widget class="QPushButton" name="cameraApplyButton">
                 <property name="text">
-                 <string>应用设备</string>
+                 <string>应用设置</string>
+                </property>
+               </widget>
+              </item>
+             </layout>
+            </item>
+            <item>
+             <layout class="QHBoxLayout" name="cameraOptionsRowLayout">
+              <item>
+               <widget class="QLabel" name="cameraFormatHintLabel">
+                <property name="text">
+                 <string>将根据当前设备自动推荐合适的视频格式。</string>
+                </property>
+                <property name="wordWrap">
+                 <bool>true</bool>
                 </property>
                </widget>
               </item>

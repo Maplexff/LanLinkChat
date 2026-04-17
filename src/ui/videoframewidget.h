@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QImage>
+#include <QPixmap>
 #include <QWidget>
 
 class VideoFrameWidget : public QWidget
@@ -17,8 +18,15 @@ public:
 
 protected:
     void paintEvent(QPaintEvent *event) override;
+    void resizeEvent(QResizeEvent *event) override;
 
 private:
+    void updateScaledFrameCache();
+
     QImage m_frame;
+    QPixmap m_scaledFrame;
+    QRect m_scaledFrameRect;
+    QSize m_cachedContentSize;
+    qint64 m_cachedFrameKey = 0;
     QString m_placeholderText;
 };

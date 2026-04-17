@@ -2,6 +2,7 @@
 
 #include <QPainter>
 #include <QPaintEvent>
+#include <QResizeEvent>
 
 VideoFrameWidget::VideoFrameWidget(QWidget *parent)
     : VideoFrameWidget(QString(), parent)
@@ -14,11 +15,16 @@ VideoFrameWidget::VideoFrameWidget(const QString &placeholderText, QWidget *pare
 {
     setMinimumSize(320, 240);
     setAutoFillBackground(false);
+    setAttribute(Qt::WA_OpaquePaintEvent, true);
 }
 
 void VideoFrameWidget::setFrame(const QImage &frame)
 {
-    m_frame = frame.isNull() ? QImage() : frame.copy();
+    m_frame = frame;
+    m_scaledFrame = QPixmap();
+    m_scaledFrameRect = QRect();
+    m_cachedContentSize = QSize();
+    m_cachedFrameKey = m_frame.isNull() ? 0 : m_frame.cacheKey();
     update();
 }
 
@@ -30,6 +36,10 @@ void VideoFrameWidget::clearFrame()
     }
 
     m_frame = QImage();
+    m_scaledFrame = QPixmap();
+    m_scaledFrameRect = QRect();
+    m_cachedContentSize = QSize();
+    m_cachedFrameKey = 0;
     update();
 }
 
@@ -43,6 +53,59 @@ void VideoFrameWidget::setPlaceholderText(const QString &placeholderText)
     update();
 }
 
+void VideoFrameWidget::resizeEvent(QResizeEvent *event)
+{
+    QWidget::resizeEvent(event);
+
+    m_scaledFrame = QPixmap();
+    m_scaledFrameRect = QRect();
+    m_cachedContentSize = QSize();
+}
+
+void VideoFrameWidget::updateScaledFrameCache()
+{
+    if (m_frame.isNull()) {
+        m_scaledFrame = QPixmap();
+        m_scaledFrameRect = QRect();
+        m_cachedContentSize = QSize();
+        m_cachedFrameKey = 0;
+        return;
+    }
+
+    const QRect contentRect = rect().adjusted(8, 8, -8, -8);
+    if (!contentRect.isValid()) {
+        m_scaledFrame = QPixmap();
+        m_scaledFrameRect = QRect();
+        m_cachedContentSize = QSize();
+        return;
+    }
+
+    const qint64 frameKey = m_frame.cacheKey();
+    if (!m_scaledFrame.isNull()
+        && m_cachedContentSize == contentRect.size()
+        && m_cachedFrameKey == frameKey) {
+        return;
+    }
+
+    const QSize scaledSize = m_frame.size().scaled(contentRect.size(), Qt::KeepAspectRatio);
+    if (!scaledSize.isValid()) {
+        m_scaledFrame = QPixmap();
+        m_scaledFrameRect = QRect();
+        m_cachedContentSize = QSize();
+        return;
+    }
+
+    const QImage scaledImage = m_frame.size() == scaledSize
+        ? m_frame
+        : m_frame.scaled(scaledSize, Qt::KeepAspectRatio, Qt::FastTransformation);
+    m_scaledFrame = QPixmap::fromImage(scaledImage);
+    m_scaledFrameRect = QRect(QPoint((width() - scaledSize.width()) / 2,
+                                     (height() - scaledSize.height()) / 2),
+                              scaledSize);
+    m_cachedContentSize = contentRect.size();
+    m_cachedFrameKey = frameKey;
+}
+
 void VideoFrameWidget::paintEvent(QPaintEvent *event)
 {
     Q_UNUSED(event);
@@ -54,13 +117,11 @@ void VideoFrameWidget::paintEvent(QPaintEvent *event)
 
     const QRect contentRect = rect().adjusted(8, 8, -8, -8);
     if (!m_frame.isNull()) {
-        const QSize targetSize = m_frame.size().scaled(contentRect.size(), Qt::KeepAspectRatio);
-        const QRect targetRect(QPoint((width() - targetSize.width()) / 2,
-                                      (height() - targetSize.height()) / 2),
-                               targetSize);
-        painter.setRenderHint(QPainter::SmoothPixmapTransform, false);
-        painter.drawImage(targetRect, m_frame);
-        return;
+        updateScaledFrameCache();
+        if (!m_scaledFrame.isNull() && m_scaledFrameRect.isValid()) {
+            painter.drawPixmap(m_scaledFrameRect.topLeft(), m_scaledFrame);
+            return;
+        }
     }
 
     painter.setPen(QColor(221, 221, 221));

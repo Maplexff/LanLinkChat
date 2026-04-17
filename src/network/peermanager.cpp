@@ -16,11 +16,13 @@
 #include <QStandardPaths>
 #include <QTcpServer>
 #include <QTcpSocket>
+#include <QThread>
 #include <QTimer>
 #include <QUuid>
 
 #include "network/discoveryservice.h"
 #include "network/peerconnection.h"
+#include "network/videodecodeworker.h"
 
 namespace {
 
@@ -32,6 +34,33 @@ QString newId()
 QString timestampIso()
 {
     return QDateTime::currentDateTime().toString(Qt::ISODate);
+}
+
+QString uniqueFilePath(const QString &directoryPath, const QString &originalFileName)
+{
+    const QString sanitizedName = originalFileName.trimmed().isEmpty()
+        ? QStringLiteral("received_file")
+        : originalFileName.trimmed();
+    const QFileInfo info(sanitizedName);
+    const QString baseName = info.completeBaseName().isEmpty() ? sanitizedName : info.completeBaseName();
+    const QString suffix = info.suffix();
+
+    QString candidate = QDir(directoryPath).filePath(sanitizedName);
+    if (!QFileInfo::exists(candidate)) {
+        return candidate;
+    }
+
+    for (int index = 1; index < 10000; ++index) {
+        const QString numberedName = suffix.isEmpty()
+            ? QStringLiteral("%1 (%2)").arg(baseName).arg(index)
+            : QStringLiteral("%1 (%2).%3").arg(baseName).arg(index).arg(suffix);
+        candidate = QDir(directoryPath).filePath(numberedName);
+        if (!QFileInfo::exists(candidate)) {
+            return candidate;
+        }
+    }
+
+    return QDir(directoryPath).filePath(QStringLiteral("%1_%2").arg(QUuid::createUuid().toString(QUuid::WithoutBraces), sanitizedName));
 }
 
 QSize transportVideoSize()
@@ -46,7 +75,7 @@ QSize transportVideoSize()
 int transportJpegQuality()
 {
 #ifdef Q_OS_LINUX
-    return 60;
+    return 68;
 #else
     return 80;
 #endif
@@ -112,6 +141,8 @@ PeerManager::PeerManager(QObject *parent)
     , m_discovery(new DiscoveryService(this))
     , m_server(new QTcpServer(this))
     , m_pruneTimer(new QTimer(this))
+    , m_videoDecodeThread(new QThread(this))
+    , m_videoDecodeWorker(new VideoDecodeWorker)
 {
     m_videoLogTimer.start();
 
@@ -126,6 +157,19 @@ PeerManager::PeerManager(QObject *parent)
     connect(m_discovery, &DiscoveryService::peerAnnounced, this, &PeerManager::onPeerAnnounced);
     connect(m_server, &QTcpServer::newConnection, this, &PeerManager::acceptPendingConnections);
     connect(m_pruneTimer, &QTimer::timeout, this, &PeerManager::prunePeers);
+    m_videoDecodeWorker->moveToThread(m_videoDecodeThread);
+    connect(this, &PeerManager::decodeVideoFrameRequested, m_videoDecodeWorker, &VideoDecodeWorker::decodeFrame, Qt::QueuedConnection);
+    connect(m_videoDecodeWorker, &VideoDecodeWorker::frameDecoded, this, &PeerManager::onVideoFrameDecoded, Qt::QueuedConnection);
+    connect(m_videoDecodeThread, &QThread::finished, m_videoDecodeWorker, &QObject::deleteLater);
+    m_videoDecodeThread->start();
+}
+
+PeerManager::~PeerManager()
+{
+    if (m_videoDecodeThread) {
+        m_videoDecodeThread->quit();
+        m_videoDecodeThread->wait();
+    }
 }
 
 QString PeerManager::localPeerId() const
@@ -161,16 +205,16 @@ void PeerManager::refreshDiscovery()
     emit noticeRaised(QStringLiteral("已发送手动发现广播，正在刷新局域网节点。"));
 }
 
-void PeerManager::sendDirectMessage(const QString &peerId, const QString &text)
+bool PeerManager::sendDirectMessage(const QString &peerId, const QString &text)
 {
     if (text.trimmed().isEmpty()) {
-        return;
+        return false;
     }
 
     PeerConnection *connection = ensureConnection(peerId);
     if (!connection) {
         emit noticeRaised(QStringLiteral("未能连接到目标节点。"));
-        return;
+        return false;
     }
 
     QJsonObject meta;
@@ -179,6 +223,7 @@ void PeerManager::sendDirectMessage(const QString &peerId, const QString &text)
     meta.insert(QStringLiteral("text"), text);
     meta.insert(QStringLiteral("timestamp"), timestampIso());
     connection->sendPacket(QStringLiteral("direct_message"), meta);
+    return true;
 }
 
 GroupInfo PeerManager::createGroup(const QString &name, const QStringList &memberIds)
@@ -411,10 +456,6 @@ void PeerManager::onPeerAnnounced(const PeerInfo &peer)
     current.online = true;
     m_peers.insert(peer.id, current);
 
-    if (!m_connectionsByPeerId.contains(peer.id) && m_localPeerId > peer.id) {
-        ensureConnection(peer.id);
-    }
-
     emitPeersChanged();
 }
 
@@ -521,32 +562,19 @@ void PeerManager::onPacketReceived(PeerConnection *connection, const QString &ty
             qWarning() << "Dropping remote video frame from" << peerId << ": invalid" << effectiveFormat << "payload, size =" << binary.size();
             return;
         }
-
-        QImage frame;
-        if (!frame.loadFromData(binary, effectiveFormat.constData()) || frame.isNull()) {
-            qWarning() << "Dropping remote video frame from" << peerId << ":" << effectiveFormat << "decode failed, size =" << binary.size();
-            return;
-        }
-
-        const QImage displayFrame = frame.convertToFormat(QImage::Format_RGB32).copy();
-        if (displayFrame.isNull()) {
-            qWarning() << "Dropping remote video frame from" << peerId << ": failed to convert decoded frame for display";
-            return;
-        }
-
-        const quint64 receivedFrameNumber = ++m_receivedVideoFrames[peerId];
         const qint64 announcedFrameNumber = static_cast<qint64>(meta.value(QStringLiteral("frameNumber")).toDouble(-1));
-        if (m_videoLogTimer.elapsed() >= 3000) {
-            qInfo() << "Video rx peer =" << peerId
-                    << "frame =" << receivedFrameNumber
-                    << "announced =" << announcedFrameNumber
-                    << "size =" << binary.size()
-                    << "resolution =" << displayFrame.size()
-                    << "format =" << effectiveFormat;
-            m_videoLogTimer.restart();
+        if (!m_videoDecodeInFlight) {
+            m_videoDecodeInFlight = true;
+            emit decodeVideoFrameRequested(peerId,
+                                           binary,
+                                           QString::fromLatin1(effectiveFormat),
+                                           announcedFrameNumber);
+        } else {
+            m_pendingVideoDecode.peerId = peerId;
+            m_pendingVideoDecode.encodedFrame = binary;
+            m_pendingVideoDecode.imageFormat = QString::fromLatin1(effectiveFormat);
+            m_pendingVideoDecode.announcedFrameNumber = announcedFrameNumber;
         }
-
-        emit remoteVideoFrameReceived(peerId, displayFrame);
         return;
     }
 
@@ -557,6 +585,45 @@ void PeerManager::onPacketReceived(PeerConnection *connection, const QString &ty
                                       meta.value(QStringLiteral("channelCount")).toInt(),
                                       meta.value(QStringLiteral("sampleFormat")).toInt());
     }
+}
+
+void PeerManager::onVideoFrameDecoded(const QString &peerId,
+                                      const QImage &frame,
+                                      const QString &imageFormat,
+                                      int payloadSize,
+                                      qint64 announcedFrameNumber)
+{
+    m_videoDecodeInFlight = false;
+
+    if (!frame.isNull()) {
+        const quint64 receivedFrameNumber = ++m_receivedVideoFrames[peerId];
+        if (m_videoLogTimer.elapsed() >= 3000) {
+            qInfo() << "Video rx peer =" << peerId
+                    << "frame =" << receivedFrameNumber
+                    << "announced =" << announcedFrameNumber
+                    << "size =" << payloadSize
+                    << "resolution =" << frame.size()
+                    << "format =" << imageFormat;
+            m_videoLogTimer.restart();
+        }
+
+        emit remoteVideoFrameReceived(peerId, frame);
+    } else {
+        qWarning() << "Dropping remote video frame from" << peerId
+                   << ":" << imageFormat << "decode failed, size =" << payloadSize;
+    }
+
+    if (m_pendingVideoDecode.encodedFrame.isEmpty() || m_pendingVideoDecode.peerId.isEmpty()) {
+        return;
+    }
+
+    const PendingVideoDecode next = m_pendingVideoDecode;
+    m_pendingVideoDecode = PendingVideoDecode();
+    m_videoDecodeInFlight = true;
+    emit decodeVideoFrameRequested(next.peerId,
+                                   next.encodedFrame,
+                                   next.imageFormat,
+                                   next.announcedFrameNumber);
 }
 
 void PeerManager::onConnectionClosed(PeerConnection *connection)
@@ -571,6 +638,11 @@ void PeerManager::onConnectionClosed(PeerConnection *connection)
         peer.online = false;
         m_peers.insert(peerId, peer);
         emitPeersChanged();
+    }
+
+    if (!peerId.isEmpty()) {
+        emit callEnded(peerId);
+        emit noticeRaised(QStringLiteral("%1 的连接已断开。").arg(peerDisplayName(peerId)));
     }
 }
 
@@ -667,14 +739,14 @@ PeerConnection *PeerManager::ensureConnection(const QString &peerId)
     }
 
     const PeerInfo peer = m_peers.value(peerId);
-    if (peer.id.isEmpty() || peer.port == 0 || peer.address.isNull()) {
+    if (peer.id.isEmpty() || peer.port == 0 || peer.address.isNull() || !peer.online) {
         return nullptr;
     }
 
     auto *socket = new QTcpSocket(this);
     socket->setSocketOption(QAbstractSocket::LowDelayOption, 1);
     socket->connectToHost(peer.address, peer.port);
-    if (!socket->waitForConnected(3000)) {
+    if (!socket->waitForConnected(600)) {
         socket->deleteLater();
         return nullptr;
     }
@@ -711,7 +783,7 @@ void PeerManager::handleIncomingFileBegin(const QJsonObject &meta)
 
     QDir().mkpath(appDataDownloadPath());
     const QString fileName = meta.value(QStringLiteral("fileName")).toString();
-    const QString savePath = QDir(appDataDownloadPath()).filePath(fileName);
+    const QString savePath = availableDownloadPath(fileName);
     auto *file = new QFile(savePath, this);
     if (!file->open(QIODevice::WriteOnly)) {
         delete file;
@@ -754,10 +826,25 @@ void PeerManager::handleIncomingFileEnd(const QJsonObject &meta)
         incoming.file->close();
     }
 
+    if (incoming.expectedSize > 0 && incoming.receivedSize != incoming.expectedSize) {
+        if (incoming.file) {
+            incoming.file->deleteLater();
+        }
+        QFile::remove(incoming.savePath);
+        emit noticeRaised(QStringLiteral("收到来自 %1 的文件 %2 时发生中断，已丢弃不完整文件。")
+                              .arg(peerDisplayName(incoming.peerId), incoming.fileName));
+        return;
+    }
+
     emit fileReceived(incoming.peerId, incoming.fileName, incoming.savePath);
     if (incoming.file) {
         incoming.file->deleteLater();
     }
+}
+
+QString PeerManager::availableDownloadPath(const QString &fileName) const
+{
+    return uniqueFilePath(appDataDownloadPath(), fileName);
 }
 
 QString PeerManager::peerDisplayName(const QString &peerId) const

@@ -16,6 +16,8 @@ class QFile;
 class QTcpServer;
 class QTcpSocket;
 class QTimer;
+class QThread;
+class VideoDecodeWorker;
 
 class PeerManager : public QObject
 {
@@ -23,6 +25,7 @@ class PeerManager : public QObject
 
 public:
     explicit PeerManager(QObject *parent = nullptr);
+    ~PeerManager() override;
 
     QString localPeerId() const;
     QString displayName() const;
@@ -31,7 +34,7 @@ public:
 
     void setDisplayName(const QString &displayName);
     void refreshDiscovery();
-    void sendDirectMessage(const QString &peerId, const QString &text);
+    bool sendDirectMessage(const QString &peerId, const QString &text);
     GroupInfo createGroup(const QString &name, const QStringList &memberIds);
     void sendGroupMessage(const QString &groupId, const QString &text);
     bool sendFile(const QString &peerId, const QString &filePath);
@@ -57,12 +60,21 @@ signals:
     void callEnded(const QString &peerId);
     void remoteVideoFrameReceived(const QString &peerId, const QImage &frame);
     void remoteAudioChunkReceived(const QString &peerId, const QByteArray &audioData, int sampleRate, int channelCount, int sampleFormat);
+    void decodeVideoFrameRequested(const QString &peerId,
+                                   const QByteArray &encodedFrame,
+                                   const QString &imageFormat,
+                                   qint64 announcedFrameNumber);
 
 private slots:
     void onPeerAnnounced(const PeerInfo &peer);
     void acceptPendingConnections();
     void onPacketReceived(PeerConnection *connection, const QString &type, const QJsonObject &meta, const QByteArray &binary);
     void onConnectionClosed(PeerConnection *connection);
+    void onVideoFrameDecoded(const QString &peerId,
+                             const QImage &frame,
+                             const QString &imageFormat,
+                             int payloadSize,
+                             qint64 announcedFrameNumber);
     void prunePeers();
 
 private:
@@ -73,6 +85,13 @@ private:
         qint64 receivedSize = 0;
         QString savePath;
         QPointer<QFile> file;
+    };
+
+    struct PendingVideoDecode {
+        QString peerId;
+        QByteArray encodedFrame;
+        QString imageFormat;
+        qint64 announcedFrameNumber = -1;
     };
 
     QStringList normalizedMembers(const QStringList &memberIds) const;
@@ -88,12 +107,15 @@ private:
     void handleIncomingFileEnd(const QJsonObject &meta);
     QString peerDisplayName(const QString &peerId) const;
     QString appDataDownloadPath() const;
+    QString availableDownloadPath(const QString &fileName) const;
 
     QString m_localPeerId;
     QString m_displayName;
     DiscoveryService *m_discovery = nullptr;
     QTcpServer *m_server = nullptr;
     QTimer *m_pruneTimer = nullptr;
+    QThread *m_videoDecodeThread = nullptr;
+    VideoDecodeWorker *m_videoDecodeWorker = nullptr;
     QHash<QString, PeerInfo> m_peers;
     QHash<QString, GroupInfo> m_groups;
     QHash<QString, PeerConnection *> m_connectionsByPeerId;
@@ -102,4 +124,6 @@ private:
     QHash<QString, quint64> m_sentVideoFrames;
     QHash<QString, quint64> m_receivedVideoFrames;
     QElapsedTimer m_videoLogTimer;
+    bool m_videoDecodeInFlight = false;
+    PendingVideoDecode m_pendingVideoDecode;
 };

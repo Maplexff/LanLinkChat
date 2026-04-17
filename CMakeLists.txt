@@ -28,9 +28,13 @@ qt_add_executable(LanLinkChat
     src/network/peermanager.h
     src/network/protocol.cpp
     src/network/protocol.h
+    src/network/videodecodeworker.cpp
+    src/network/videodecodeworker.h
     src/ui/mainwindow.cpp
     src/ui/mainwindow.h
     src/ui/mainwindow.ui
+    src/ui/videoencodeworker.cpp
+    src/ui/videoencodeworker.h
     src/ui/videoframewidget.cpp
     src/ui/videoframewidget.h
 )
