@@ -1532,7 +1532,7 @@ void MainWindow::updateCameraFormatHint()
     }
 
 #ifndef LANLINKCHAT_HAS_OPENCV
-    m_ui->cameraFormatHintLabel->setText(QStringLiteral("当前构建未启用 OpenCV 采集，请安装 libopencv-dev 后重新编译。"));
+    m_ui->cameraFormatHintLabel->setText(QStringLiteral("当前构建未启用 OpenCV 采集，请安装 OpenCV 后重新编译。"));
     m_ui->cameraFormatHintLabel->setToolTip(m_ui->cameraFormatHintLabel->text());
     return;
 #endif
@@ -1591,7 +1591,7 @@ void MainWindow::updateCameraFormatHint()
 bool MainWindow::ensureCameraRunning()
 {
 #ifndef LANLINKCHAT_HAS_OPENCV
-    reportCameraIssue(QStringLiteral("当前构建未启用 OpenCV 采集，请安装 libopencv-dev 后重新编译。"), true);
+    reportCameraIssue(QStringLiteral("当前构建未启用 OpenCV 采集，请安装 OpenCV 并让构建系统找到其 include/lib 后重新编译。"), true);
     return false;
 #else
     if (m_cameraThread && m_cameraThread->isRunning()) {

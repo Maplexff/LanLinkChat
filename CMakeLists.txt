@@ -63,7 +63,7 @@ if(OpenCV_FOUND)
         target_link_libraries(LanLinkChat PRIVATE ${VA_LIBRARY})
     endif()
 else()
-    message(WARNING "OpenCV was not found. Install libopencv-dev to enable OpenCV camera capture.")
+    message(WARNING "OpenCV was not found. Install OpenCV and set OpenCV_DIR if needed to enable OpenCV camera capture.")
 endif()
 
 qt_finalize_executable(LanLinkChat)

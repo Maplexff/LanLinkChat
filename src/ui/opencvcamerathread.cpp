@@ -247,7 +247,7 @@ void OpenCvCameraThread::stopCapture()
 void OpenCvCameraThread::run()
 {
 #ifndef LANLINKCHAT_HAS_OPENCV
-    emit cameraError(QStringLiteral("当前构建未启用 OpenCV 采集，请安装 libopencv-dev 后重新编译。"));
+    emit cameraError(QStringLiteral("当前构建未启用 OpenCV 采集，请先安装 OpenCV，并让构建系统找到其 include/lib 后重新编译。"));
     emit cameraActiveChanged(false);
     return;
 #else
