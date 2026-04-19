@@ -63,26 +63,44 @@ unix {
 }
 
 win32 {
+    OPENCV_INCLUDE_DIR = $$clean_path($$OPENCV_INCLUDE_DIR)
+    isEmpty(OPENCV_INCLUDE_DIR): OPENCV_INCLUDE_DIR = $$clean_path($$(OPENCV_INCLUDE_DIR))
+    OPENCV_LIB_DIR = $$clean_path($$OPENCV_LIB_DIR)
+    isEmpty(OPENCV_LIB_DIR): OPENCV_LIB_DIR = $$clean_path($$(OPENCV_LIB_DIR))
+
     OPENCV_ROOT_CANDIDATES = \
+        $$clean_path($$OpenCV_DIR) \
+        $$clean_path($$OPENCV_DIR) \
+        $$clean_path($$OPENCV_ROOT) \
         $$clean_path($$(OpenCV_DIR)) \
         $$clean_path($$(OPENCV_DIR)) \
         $$clean_path($$(OPENCV_ROOT)) \
-        C:/opencv/build \
-        C:/tools/opencv/build
+        D:/APP/msys64/mingw64
+
+    # Add default fallback paths only if you actually have OpenCV there:
+    # OPENCV_ROOT_CANDIDATES += C:/opencv/build C:/tools/opencv/build
 
     for(root, OPENCV_ROOT_CANDIDATES) {
         isEmpty(root): next()
 
         OPENCV_INCLUDE_CANDIDATES = \
             $$root/include \
-            $$root/../include
+            $$root/include/opencv4 \
+            $$root/../include \
+            $$root/../include/opencv4 \
+            $$root/../../include \
+            $$root/../../include/opencv4 \
+            $$root/../../../include \
+            $$root/../../../include/opencv4
 
         win32-g++ {
             OPENCV_LIB_CANDIDATES = \
                 $$root/x64/mingw/lib \
                 $$root/lib \
                 $$root/../x64/mingw/lib \
-                $$root/../lib
+                $$root/../lib \
+                $$root/../../lib \
+                $$root/../../../lib
         } else {
             OPENCV_LIB_CANDIDATES = \
                 $$root/x64/vc17/lib \
@@ -92,7 +110,9 @@ win32 {
                 $$root/../x64/vc17/lib \
                 $$root/../x64/vc16/lib \
                 $$root/../x64/vc15/lib \
-                $$root/../lib
+                $$root/../lib \
+                $$root/../../lib \
+                $$root/../../../lib
         }
 
         for(includeDir, OPENCV_INCLUDE_CANDIDATES) {
@@ -159,13 +179,13 @@ win32 {
             INCLUDEPATH += $$OPENCV_INCLUDE_DIR
             LIBS += $$OPENCV_COMPONENT_LIBS
         } else {
-            warning("OpenCV libraries were not found in $$OPENCV_LIB_DIR. Set OpenCV_DIR/OPENCV_DIR/OPENCV_ROOT to your OpenCV build folder before running qmake.")
+            warning("OpenCV libraries were not found in $$OPENCV_LIB_DIR. Set OpenCV_DIR/OPENCV_DIR/OPENCV_ROOT, or OPENCV_INCLUDE_DIR and OPENCV_LIB_DIR, before running qmake.")
         }
     } else {
         win32-g++ {
-            warning("OpenCV MinGW libraries were not found on Windows. Install a MinGW build of OpenCV and set OpenCV_DIR/OPENCV_DIR/OPENCV_ROOT before running qmake.")
+            warning("OpenCV MinGW libraries were not found on Windows. Install a MinGW build of OpenCV and set OpenCV_DIR/OPENCV_DIR/OPENCV_ROOT, or OPENCV_INCLUDE_DIR and OPENCV_LIB_DIR, before running qmake.")
         } else {
-            warning("OpenCV MSVC libraries were not found on Windows. Set OpenCV_DIR/OPENCV_DIR/OPENCV_ROOT to your OpenCV build folder before running qmake.")
+            warning("OpenCV MSVC libraries were not found on Windows. Set OpenCV_DIR/OPENCV_DIR/OPENCV_ROOT, or OPENCV_INCLUDE_DIR and OPENCV_LIB_DIR, before running qmake.")
         }
     }
 }
@@ -173,3 +193,86 @@ win32 {
 win32:CONFIG(release, debug|release): DESTDIR = $$PWD/bin/release
 else:win32:CONFIG(debug, debug|release): DESTDIR = $$PWD/bin/debug
 else:unix: DESTDIR = $$PWD/bin
+
+win32:equals(OPENCV_ENABLED, true) {
+    OPENCV_BIN_DIR = $$clean_path($$OPENCV_BIN_DIR)
+    isEmpty(OPENCV_BIN_DIR): OPENCV_BIN_DIR = $$clean_path($$(OPENCV_BIN_DIR))
+
+    isEmpty(OPENCV_BIN_DIR) {
+        OPENCV_BIN_CANDIDATES = \
+            $$OPENCV_ROOT/bin \
+            $$OpenCV_DIR/bin \
+            $$OPENCV_DIR/bin \
+            $$clean_path($$(OPENCV_ROOT)/bin) \
+            $$clean_path($$(OpenCV_DIR)/bin) \
+            $$clean_path($$(OPENCV_DIR)/bin) \
+            $$OPENCV_LIB_DIR/../bin \
+            $$OPENCV_LIB_DIR/../../bin
+
+        for(binDir, OPENCV_BIN_CANDIDATES) {
+            exists($$binDir/libopencv_core*.dll) {
+                OPENCV_BIN_DIR = $$clean_path($$binDir)
+                break()
+            }
+        }
+    }
+
+    !isEmpty(OPENCV_BIN_DIR) {
+        OPENCV_RUNTIME_PATTERNS = \
+            libopencv_core*.dll \
+            libopencv_imgcodecs*.dll \
+            libopencv_imgproc*.dll \
+            libopencv_videoio*.dll \
+            avcodec-*.dll \
+            avdevice-*.dll \
+            avfilter-*.dll \
+            avformat-*.dll \
+            avutil-*.dll \
+            libgsm*.dll \
+            libglib-*.dll \
+            libgobject-*.dll \
+            libgio-*.dll \
+            libgmodule-*.dll \
+            libgthread-*.dll \
+            libgst*.dll \
+            libgcc_s_seh-*.dll \
+            libgfortran-*.dll \
+            libgomp-*.dll \
+            libtbb*.dll \
+            libstdc++-*.dll \
+            libwinpthread-*.dll \
+            libcaca*.dll \
+            libopenblas*.dll \
+            libopenal-*.dll \
+            libjpeg*.dll \
+            libpng*.dll \
+            libtiff*.dll \
+            libwebp*.dll \
+            libopenjp*.dll \
+            libOpenEXR*.dll \
+            libImath*.dll \
+            libIex*.dll \
+            libIlmThread*.dll \
+            swresample-*.dll \
+            swscale-*.dll \
+            zlib1.dll \
+            postproc-*.dll
+
+        OPENCV_RUNTIME_DLLS =
+        for(pattern, OPENCV_RUNTIME_PATTERNS) {
+            OPENCV_RUNTIME_DLLS += $$files($$OPENCV_BIN_DIR/$$pattern, true)
+        }
+        OPENCV_RUNTIME_DLLS = $$unique(OPENCV_RUNTIME_DLLS)
+
+        !isEmpty(OPENCV_RUNTIME_DLLS) {
+            message("OpenCV and FFmpeg runtime DLLs will be copied from $$OPENCV_BIN_DIR to $$DESTDIR")
+            for(dll, OPENCV_RUNTIME_DLLS) {
+                QMAKE_POST_LINK += $$quote(xcopy /Y \"$$shell_path($$dll)\" \"$$shell_path($$DESTDIR/)\" $$escape_expand(\n\t))
+            }
+        } else {
+            warning("OpenCV runtime DLLs were not found in $$OPENCV_BIN_DIR. Add this folder to PATH or set OPENCV_BIN_DIR before running.")
+        }
+    } else {
+        warning("OpenCV runtime DLL directory was not found. Add your OpenCV bin folder to PATH or set OPENCV_BIN_DIR before running.")
+    }
+}

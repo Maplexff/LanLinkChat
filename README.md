@@ -30,3 +30,7 @@
 - 音视频通话当前使用 TCP 连接传输视频帧与 PCM 音频，语音不依赖额外服务器。
 - 如果 `CMake` 导入时报 `Qt6_DIR-NOTFOUND` 或缺少 `Release/Debug` 配置，通常是 Qt Creator 的 kit 或旧 build 缓存有问题，此时可直接改用 `.pro` 导入，或清理已有 build 目录后重新选择正确的 Qt 6 kit。
 - 群聊是去中心化的，本机创建群后会把群信息同步给成员，群消息由发送者复制分发到各成员。
+
+## 复制依赖
+powershell -ExecutionPolicy Bypass -File "D:\videoCourse\LanLinkChat\deploy_release.ps1"
+
