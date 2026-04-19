@@ -1,6 +1,7 @@
 # LanLinkChat
 
 这是一个基于 `Qt6 + CMake + Widgets` 的局域网聊天原型，目标是让你在 `Qt Creator` 中直接打开并用自带 kit 编译。
+注意使用msys2配置opencv库
 
 ## 功能
 
