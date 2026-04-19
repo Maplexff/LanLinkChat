@@ -8,15 +8,13 @@
 #include <QMainWindow>
 #include <QResizeEvent>
 
-#include <QMediaCaptureSession>
-
 #include "model/chattypes.h"
 #include "model/peerinfo.h"
 
+class OpenCvCameraThread;
 class PeerManager;
 class QAudioSink;
 class QAudioSource;
-class QCamera;
 class QCameraDevice;
 class QCameraFormat;
 class QMediaDevices;
@@ -30,8 +28,6 @@ class QPushButton;
 class QTabWidget;
 class QTimer;
 class QThread;
-class QVideoFrame;
-class QVideoSink;
 class QLabel;
 class VideoFrameWidget;
 class VideoEncodeWorker;
@@ -72,21 +68,25 @@ private slots:
     void onCallInvitationReceived(const QString &peerId);
     void onCallAccepted(const QString &peerId);
     void onCallEnded(const QString &peerId);
+    void onRemoteVideoSendingChanged(const QString &peerId, bool enabled);
     void onRemoteVideoFrameReceived(const QString &peerId, const QImage &frame);
     void onRemoteAudioChunkReceived(const QString &peerId, const QByteArray &audioData, int sampleRate, int channelCount, int sampleFormat);
     void onEncodedVideoFrame(const QString &peerId,
                              const QByteArray &encodedFrame,
                              const QString &imageFormat,
                              const QSize &frameSize);
-    void processLocalFrame(const QVideoFrame &frame);
+    void processLocalFrame(const QImage &frame);
     void readLocalAudioInput();
     void flushVideoFrames();
     void updateActionState();
     void onVideoInputsChanged();
     void onAudioInputsChanged();
     void onAudioOutputsChanged();
-    void onCameraErrorOccurred();
+    void onCameraErrorOccurred(const QString &message);
     void onCameraActiveChanged(bool active);
+    void onCameraCaptureFormatResolved(const QSize &resolution,
+                                       double frameRate,
+                                       const QString &backendName);
     void onAudioSourceStateChanged();
     void onAudioSinkStateChanged();
 
@@ -98,6 +98,10 @@ private:
     void saveConversationState() const;
     void scheduleConversationStateSave();
     void updateTranscriptView(const QString &conversationKey, bool forceFullRefresh = false);
+    void clearCallFrames();
+    void clearLocalCallFrame();
+    void clearRemoteCallFrame();
+    void updateCallStatusLabel();
     void populateCameraDevices();
     void populateCameraFormats(const QString &preferredFormatKey = {});
     bool prepareCallCamera();
@@ -109,6 +113,8 @@ private:
     QString groupName(const QString &groupId) const;
     QString peerListLabel(const PeerInfo &peer) const;
     QString groupListLabel(const GroupInfo &group) const;
+    QString selectedCameraDevicePath() const;
+    int selectedCameraDeviceIndex() const;
     QCameraDevice selectedCameraDevice() const;
     QCameraFormat selectedCameraFormat(const QCameraDevice &device) const;
     void selectGroup(const QString &groupId);
@@ -142,9 +148,7 @@ private:
     int m_displayedConversationLineCount = 0;
 
     QMediaDevices *m_mediaDevices = nullptr;
-    QCamera *m_camera = nullptr;
-    QMediaCaptureSession m_captureSession;
-    QVideoSink *m_videoSink = nullptr;
+    OpenCvCameraThread *m_cameraThread = nullptr;
     QTimer *m_videoRefreshTimer = nullptr;
     QTimer *m_stateSaveTimer = nullptr;
     QThread *m_videoEncodeThread = nullptr;
@@ -154,6 +158,7 @@ private:
     QAudioSink *m_audioSink = nullptr;
     QIODevice *m_audioOutputDevice = nullptr;
     bool m_cameraErrorDialogVisible = false;
+    bool m_cameraActive = false;
     QAudioFormat m_audioInputFormat;
     QAudioFormat m_audioOutputFormat;
     QElapsedTimer m_frameLimiter;
@@ -166,6 +171,10 @@ private:
     QImage m_pendingVideoEncodeFrame;
     QString m_pendingVideoPeerId;
     bool m_videoEncodeInFlight = false;
+    int m_filteredLocalFrameCount = 0;
+    QSize m_activeCameraResolution;
+    double m_activeCameraFrameRate = 0.0;
+    QString m_cameraBackendName;
     QString m_lastStatusMessage;
     QElapsedTimer m_statusMessageLimiter;
 };

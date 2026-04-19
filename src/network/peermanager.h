@@ -41,6 +41,7 @@ public:
     void inviteToCall(const QString &peerId);
     void acceptCall(const QString &peerId);
     void endCall(const QString &peerId);
+    void setVideoSendingEnabled(const QString &peerId, bool enabled);
     void sendVideoFrame(const QString &peerId, const QImage &frame);
     void sendEncodedVideoFrame(const QString &peerId,
                                const QByteArray &encodedFrame,
@@ -58,6 +59,7 @@ signals:
     void callInvitationReceived(const QString &peerId);
     void callAccepted(const QString &peerId);
     void callEnded(const QString &peerId);
+    void remoteVideoSendingChanged(const QString &peerId, bool enabled);
     void remoteVideoFrameReceived(const QString &peerId, const QImage &frame);
     void remoteAudioChunkReceived(const QString &peerId, const QByteArray &audioData, int sampleRate, int channelCount, int sampleFormat);
     void decodeVideoFrameRequested(const QString &peerId,

@@ -15,6 +15,8 @@ find_package(Qt6 6.5 REQUIRED COMPONENTS
     Network
     Multimedia
 )
+find_package(OpenCV QUIET COMPONENTS core imgproc videoio)
+find_library(VA_LIBRARY NAMES va libva.so.2)
 
 qt_add_executable(LanLinkChat
     src/main.cpp
@@ -33,6 +35,8 @@ qt_add_executable(LanLinkChat
     src/ui/mainwindow.cpp
     src/ui/mainwindow.h
     src/ui/mainwindow.ui
+    src/ui/opencvcamerathread.cpp
+    src/ui/opencvcamerathread.h
     src/ui/videoencodeworker.cpp
     src/ui/videoencodeworker.h
     src/ui/videoframewidget.cpp
@@ -48,5 +52,18 @@ target_link_libraries(LanLinkChat PRIVATE
 )
 
 target_include_directories(LanLinkChat PRIVATE src)
+
+if(OpenCV_FOUND)
+    target_compile_definitions(LanLinkChat PRIVATE LANLINKCHAT_HAS_OPENCV)
+    target_link_libraries(LanLinkChat PRIVATE ${OpenCV_LIBS})
+    target_include_directories(LanLinkChat PRIVATE ${OpenCV_INCLUDE_DIRS})
+    if(VA_LIBRARY)
+        target_link_options(LanLinkChat PRIVATE -Wl,--copy-dt-needed-entries)
+        target_link_options(LanLinkChat PRIVATE -Wl,--allow-shlib-undefined)
+        target_link_libraries(LanLinkChat PRIVATE ${VA_LIBRARY})
+    endif()
+else()
+    message(WARNING "OpenCV was not found. Install libopencv-dev to enable OpenCV camera capture.")
+endif()
 
 qt_finalize_executable(LanLinkChat)

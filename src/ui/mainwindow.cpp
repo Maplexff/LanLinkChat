@@ -7,7 +7,6 @@
 #include <QAudioFormat>
 #include <QAudioSink>
 #include <QAudioSource>
-#include <QCamera>
 #include <QCameraDevice>
 #include <QCameraFormat>
 #include <QDateTime>
@@ -31,16 +30,17 @@
 #include <QSettings>
 #include <QStatusBar>
 #include <QTextOption>
+#include <QRegularExpression>
 #include <QThread>
 #include <QTimer>
-#include <QVideoFrame>
 #include <QVideoFrameFormat>
-#include <QVideoSink>
 
 #include <algorithm>
 #include <limits>
+#include <QVector>
 
 #include "network/peermanager.h"
+#include "ui/opencvcamerathread.h"
 #include "ui/videoencodeworker.h"
 #include "ui/videoframewidget.h"
 
@@ -199,359 +199,122 @@ QAudioFormat formatFromWire(int sampleRate, int channelCount, int sampleFormat)
     return format;
 }
 
-int clampColor(int value)
+QString cameraDevicePathFromId(const QByteArray &deviceId)
 {
-    return qBound(0, value, 255);
-}
-
-enum class PackedYuv422Order {
-    YUYV,
-    UYVY,
-    YVYU,
-    VYUY
-};
-
-PackedYuv422Order packedOrderFromPixelFormat(QVideoFrameFormat::PixelFormat pixelFormat)
-{
-    switch (pixelFormat) {
-    case QVideoFrameFormat::Format_UYVY:
-        return PackedYuv422Order::UYVY;
-    case QVideoFrameFormat::Format_YUYV:
-    default:
-        return PackedYuv422Order::YUYV;
-    }
-}
-
-QRgb yuvToRgb(int yValue, int uValue, int vValue)
-{
-    const int c = qMax(0, yValue - 16);
-    const int d = uValue - 128;
-    const int e = vValue - 128;
-    const int r = clampColor((298 * c + 409 * e + 128) >> 8);
-    const int g = clampColor((298 * c - 100 * d - 208 * e + 128) >> 8);
-    const int b = clampColor((298 * c + 516 * d + 128) >> 8);
-    return qRgb(r, g, b);
-}
-
-QImage convertPackedYuv422FrameToImage(const QVideoFrame &frame, PackedYuv422Order order)
-{
-    QVideoFrame mappedFrame(frame);
-    if (!mappedFrame.map(QVideoFrame::ReadOnly)) {
+    const QString rawId = QString::fromLatin1(deviceId);
+    if (rawId.isEmpty()) {
         return {};
     }
 
-    const QSize size = mappedFrame.size();
-    if (!size.isValid() || size.width() < 2 || size.height() < 1) {
-        mappedFrame.unmap();
-        return {};
+    static const QRegularExpression devicePathPattern(QStringLiteral("(/dev/video\\d+)"));
+    const QRegularExpressionMatch match = devicePathPattern.match(rawId);
+    if (match.hasMatch()) {
+        return match.captured(1);
     }
 
-    const uchar *source = mappedFrame.bits(0);
-    const int bytesPerLine = mappedFrame.bytesPerLine(0);
-    if (!source || bytesPerLine < size.width() * 2) {
-        mappedFrame.unmap();
-        return {};
+    if (rawId.startsWith(QStringLiteral("/dev/video"))) {
+        return rawId;
     }
 
-    QImage image(size, QImage::Format_RGB32);
-    if (image.isNull()) {
-        mappedFrame.unmap();
-        return {};
-    }
-
-    image.fill(Qt::black);
-
-    const int evenWidth = size.width() & ~1;
-    for (int y = 0; y < size.height(); ++y) {
-        const uchar *line = source + y * bytesPerLine;
-        QRgb *dest = reinterpret_cast<QRgb *>(image.scanLine(y));
-
-        for (int x = 0; x < evenWidth; x += 2) {
-            const int offset = x * 2;
-            int y0 = 0;
-            int y1 = 0;
-            int u = 128;
-            int v = 128;
-
-            switch (order) {
-            case PackedYuv422Order::YUYV:
-                y0 = line[offset + 0];
-                u = line[offset + 1];
-                y1 = line[offset + 2];
-                v = line[offset + 3];
-                break;
-            case PackedYuv422Order::UYVY:
-                u = line[offset + 0];
-                y0 = line[offset + 1];
-                v = line[offset + 2];
-                y1 = line[offset + 3];
-                break;
-            case PackedYuv422Order::YVYU:
-                y0 = line[offset + 0];
-                v = line[offset + 1];
-                y1 = line[offset + 2];
-                u = line[offset + 3];
-                break;
-            case PackedYuv422Order::VYUY:
-                v = line[offset + 0];
-                y0 = line[offset + 1];
-                u = line[offset + 2];
-                y1 = line[offset + 3];
-                break;
-            }
-
-            dest[x] = yuvToRgb(y0, u, v);
-            dest[x + 1] = yuvToRgb(y1, u, v);
-        }
-
-        if (size.width() % 2 == 1 && size.width() > 1) {
-            dest[size.width() - 1] = dest[size.width() - 2];
-        }
-    }
-
-    mappedFrame.unmap();
-    return image;
-}
-
-qint64 imageDifferenceScore(const QImage &candidate, const QImage &reference)
-{
-    if (candidate.isNull() || reference.isNull()) {
-        return std::numeric_limits<qint64>::max();
-    }
-
-    const QSize compareSize(80, 45);
-    const QImage left = candidate.scaled(compareSize, Qt::IgnoreAspectRatio, Qt::FastTransformation)
-                            .convertToFormat(QImage::Format_RGB32);
-    const QImage right = reference.scaled(compareSize, Qt::IgnoreAspectRatio, Qt::FastTransformation)
-                             .convertToFormat(QImage::Format_RGB32);
-
-    qint64 score = 0;
-    for (int y = 0; y < compareSize.height(); ++y) {
-        const QRgb *leftLine = reinterpret_cast<const QRgb *>(left.constScanLine(y));
-        const QRgb *rightLine = reinterpret_cast<const QRgb *>(right.constScanLine(y));
-        for (int x = 0; x < compareSize.width(); ++x) {
-            score += qAbs(qRed(leftLine[x]) - qRed(rightLine[x]));
-            score += qAbs(qGreen(leftLine[x]) - qGreen(rightLine[x]));
-            score += qAbs(qBlue(leftLine[x]) - qBlue(rightLine[x]));
-        }
-    }
-
-    return score;
-}
-
-qint64 imageBandDifferenceScore(const QImage &candidate,
-                                const QImage &reference,
-                                int rowStart,
-                                int rowEnd)
-{
-    if (candidate.isNull() || reference.isNull() || rowStart >= rowEnd) {
-        return std::numeric_limits<qint64>::max();
-    }
-
-    const QSize compareSize(96, 54);
-    const QImage left = candidate.scaled(compareSize, Qt::IgnoreAspectRatio, Qt::FastTransformation)
-                            .convertToFormat(QImage::Format_RGB32);
-    const QImage right = reference.scaled(compareSize, Qt::IgnoreAspectRatio, Qt::FastTransformation)
-                             .convertToFormat(QImage::Format_RGB32);
-
-    const int firstRow = qBound(0, rowStart, compareSize.height());
-    const int lastRow = qBound(firstRow, rowEnd, compareSize.height());
-    qint64 score = 0;
-    for (int y = firstRow; y < lastRow; ++y) {
-        const QRgb *leftLine = reinterpret_cast<const QRgb *>(left.constScanLine(y));
-        const QRgb *rightLine = reinterpret_cast<const QRgb *>(right.constScanLine(y));
-        for (int x = 0; x < compareSize.width(); ++x) {
-            score += qAbs(qRed(leftLine[x]) - qRed(rightLine[x]));
-            score += qAbs(qGreen(leftLine[x]) - qGreen(rightLine[x]));
-            score += qAbs(qBlue(leftLine[x]) - qBlue(rightLine[x]));
-        }
-    }
-
-    return score;
-}
-
-bool looksLikeBottomStripeCorruption(const QImage &candidate, const QImage &reference)
-{
-    if (candidate.isNull() || reference.isNull()) {
-        return false;
-    }
-
-    constexpr int compareWidth = 96;
-    constexpr int compareHeight = 54;
-    constexpr int bottomRows = 12;
-    constexpr int topRows = compareHeight - bottomRows;
-    constexpr qreal maxTopAverageDiff = 10.0;
-    constexpr qreal minBottomAverageDiff = 24.0;
-    constexpr qreal bottomToTopRatio = 3.2;
-
-    const qint64 topScore = imageBandDifferenceScore(candidate, reference, 0, topRows);
-    const qint64 bottomScore = imageBandDifferenceScore(candidate, reference, topRows, compareHeight);
-    if (topScore == std::numeric_limits<qint64>::max()
-        || bottomScore == std::numeric_limits<qint64>::max()) {
-        return false;
-    }
-
-    const qreal topAverage = static_cast<qreal>(topScore) / (compareWidth * topRows * 3);
-    const qreal bottomAverage = static_cast<qreal>(bottomScore) / (compareWidth * bottomRows * 3);
-    return topAverage <= maxTopAverageDiff
-        && bottomAverage >= minBottomAverageDiff
-        && bottomAverage >= topAverage * bottomToTopRatio;
-}
-
-QImage bestPackedYuv422TransportImage(const QVideoFrame &frame, const QImage &referenceImage)
-{
-    const QList<PackedYuv422Order> candidates = {
-        PackedYuv422Order::YUYV,
-        PackedYuv422Order::UYVY,
-        PackedYuv422Order::YVYU,
-        PackedYuv422Order::VYUY
-    };
-
-    QImage bestImage;
-    qint64 bestScore = std::numeric_limits<qint64>::max();
-    for (PackedYuv422Order candidate : candidates) {
-        const QImage image = convertPackedYuv422FrameToImage(frame, candidate);
-        const qint64 score = imageDifferenceScore(image, referenceImage);
-        if (score < bestScore) {
-            bestScore = score;
-            bestImage = image;
-        }
-    }
-
-    return bestImage;
-}
-
-QImage convertPlanarYuv420FrameToImage(const QVideoFrame &frame, bool nv21Layout, bool yv12Layout)
-{
-    QVideoFrame mappedFrame(frame);
-    if (!mappedFrame.map(QVideoFrame::ReadOnly)) {
-        return {};
-    }
-
-    const QSize size = mappedFrame.size();
-    if (!size.isValid()) {
-        mappedFrame.unmap();
-        return {};
-    }
-
-    const uchar *yPlane = mappedFrame.bits(0);
-    const int yStride = mappedFrame.bytesPerLine(0);
-    if (!yPlane || yStride < size.width()) {
-        mappedFrame.unmap();
-        return {};
-    }
-
-    const bool isSemiPlanar = mappedFrame.planeCount() >= 2 && mappedFrame.bits(1);
-    const uchar *uPlane = nullptr;
-    const uchar *vPlane = nullptr;
-    int uStride = 0;
-    int vStride = 0;
-    const uchar *uvPlane = nullptr;
-    int uvStride = 0;
-
-    if (isSemiPlanar) {
-        uvPlane = mappedFrame.bits(1);
-        uvStride = mappedFrame.bytesPerLine(1);
-        if (!uvPlane || uvStride < ((size.width() + 1) / 2) * 2) {
-            mappedFrame.unmap();
-            return {};
-        }
-    } else {
-        uPlane = mappedFrame.bits(yv12Layout ? 2 : 1);
-        vPlane = mappedFrame.bits(yv12Layout ? 1 : 2);
-        uStride = mappedFrame.bytesPerLine(yv12Layout ? 2 : 1);
-        vStride = mappedFrame.bytesPerLine(yv12Layout ? 1 : 2);
-        const int chromaWidth = (size.width() + 1) / 2;
-        if (!uPlane || !vPlane || uStride < chromaWidth || vStride < chromaWidth) {
-            mappedFrame.unmap();
-            return {};
-        }
-    }
-
-    QImage image(size, QImage::Format_RGB32);
-    if (image.isNull()) {
-        mappedFrame.unmap();
-        return {};
-    }
-
-    for (int y = 0; y < size.height(); ++y) {
-        const uchar *yRow = yPlane + y * yStride;
-        QRgb *dest = reinterpret_cast<QRgb *>(image.scanLine(y));
-        const int chromaY = y / 2;
-
-        for (int x = 0; x < size.width(); ++x) {
-            const int chromaX = x / 2;
-            int u = 128;
-            int v = 128;
-
-            if (isSemiPlanar) {
-                const uchar *uvRow = uvPlane + chromaY * uvStride;
-                const int uvOffset = chromaX * 2;
-                u = nv21Layout ? uvRow[uvOffset + 1] : uvRow[uvOffset + 0];
-                v = nv21Layout ? uvRow[uvOffset + 0] : uvRow[uvOffset + 1];
-            } else {
-                u = *(uPlane + chromaY * uStride + chromaX);
-                v = *(vPlane + chromaY * vStride + chromaX);
-            }
-
-            dest[x] = yuvToRgb(yRow[x], u, v);
-        }
-    }
-
-    mappedFrame.unmap();
-    return image;
-}
-
-QImage frameToDisplayImage(const QVideoFrame &frame, const QImage &referenceImage = {})
-{
-    switch (frame.pixelFormat()) {
-    case QVideoFrameFormat::Format_YUYV:
-    case QVideoFrameFormat::Format_UYVY:
-        if (!referenceImage.isNull()) {
-            if (const QImage image = bestPackedYuv422TransportImage(frame, referenceImage); !image.isNull()) {
-                return image;
-            }
-        }
-        if (const QImage image = convertPackedYuv422FrameToImage(frame, packedOrderFromPixelFormat(frame.pixelFormat())); !image.isNull()) {
-            return image;
-        }
-        break;
-    case QVideoFrameFormat::Format_NV12:
-        if (const QImage image = convertPlanarYuv420FrameToImage(frame, false, false); !image.isNull()) {
-            return image;
-        }
-        break;
-    case QVideoFrameFormat::Format_NV21:
-        if (const QImage image = convertPlanarYuv420FrameToImage(frame, true, false); !image.isNull()) {
-            return image;
-        }
-        break;
-    case QVideoFrameFormat::Format_YUV420P:
-        if (const QImage image = convertPlanarYuv420FrameToImage(frame, false, false); !image.isNull()) {
-            return image;
-        }
-        break;
-    case QVideoFrameFormat::Format_YV12:
-        if (const QImage image = convertPlanarYuv420FrameToImage(frame, false, true); !image.isNull()) {
-            return image;
-        }
-        break;
-    default:
-        break;
-    }
-
-    if (const QImage directImage = frame.toImage(); !directImage.isNull()) {
-        const QImage rgbImage = directImage.convertToFormat(QImage::Format_RGB32);
-        return rgbImage;
+    if (rawId.startsWith(QStringLiteral("video"))) {
+        return QStringLiteral("/dev/%1").arg(rawId);
     }
 
     return {};
 }
 
-QImage frameToTransportImage(const QVideoFrame &frame, const QImage &displayImage)
+QImage scaledComparisonImage(const QImage &image)
 {
-    Q_UNUSED(frame);
-    return displayImage;
+    if (image.isNull()) {
+        return {};
+    }
+
+    return image.scaled(QSize(96, 72), Qt::IgnoreAspectRatio, Qt::FastTransformation)
+        .convertToFormat(QImage::Format_RGB32);
+}
+
+qreal averageRgbDifference(const QImage &left, const QImage &right, const QRect &rect)
+{
+    if (left.isNull() || right.isNull() || rect.isEmpty()) {
+        return 0.0;
+    }
+
+    qint64 score = 0;
+    int pixelCount = 0;
+    const QRect boundedRect = rect.intersected(QRect(QPoint(0, 0), left.size()))
+                                  .intersected(QRect(QPoint(0, 0), right.size()));
+    for (int y = boundedRect.top(); y <= boundedRect.bottom(); ++y) {
+        const QRgb *leftLine = reinterpret_cast<const QRgb *>(left.constScanLine(y));
+        const QRgb *rightLine = reinterpret_cast<const QRgb *>(right.constScanLine(y));
+        for (int x = boundedRect.left(); x <= boundedRect.right(); ++x) {
+            score += qAbs(qRed(leftLine[x]) - qRed(rightLine[x]));
+            score += qAbs(qGreen(leftLine[x]) - qGreen(rightLine[x]));
+            score += qAbs(qBlue(leftLine[x]) - qBlue(rightLine[x]));
+            ++pixelCount;
+        }
+    }
+
+    return pixelCount == 0 ? 0.0 : static_cast<qreal>(score) / (pixelCount * 3);
+}
+
+qreal medianValue(QVector<qreal> values)
+{
+    if (values.isEmpty()) {
+        return 0.0;
+    }
+
+    std::sort(values.begin(), values.end());
+    return values.at(values.size() / 2);
+}
+
+bool looksLikeLocalFrameCorruption(const QImage &candidate, const QImage &reference)
+{
+    if (candidate.isNull() || reference.isNull()) {
+        return false;
+    }
+
+    const QImage left = scaledComparisonImage(candidate);
+    const QImage right = scaledComparisonImage(reference);
+    if (left.isNull() || right.isNull() || left.size() != right.size()) {
+        return false;
+    }
+
+    QVector<qreal> bandDiffs;
+    bandDiffs.reserve(12);
+    for (int band = 0; band < 12; ++band) {
+        bandDiffs.append(averageRgbDifference(left, right, QRect(0, band * 6, 96, 6)));
+    }
+
+    const qreal medianBandDiff = medianValue(bandDiffs);
+    const qreal maxBandDiff = *std::max_element(bandDiffs.constBegin(), bandDiffs.constEnd());
+    if (medianBandDiff <= 18.0
+        && maxBandDiff >= 55.0
+        && maxBandDiff >= qMax<qreal>(medianBandDiff * 4.0, 45.0)) {
+        return true;
+    }
+
+    QVector<qreal> cellDiffs;
+    cellDiffs.reserve(48);
+    for (int row = 0; row < 6; ++row) {
+        for (int column = 0; column < 8; ++column) {
+            cellDiffs.append(averageRgbDifference(left, right, QRect(column * 12, row * 12, 12, 12)));
+        }
+    }
+
+    const qreal medianCellDiff = medianValue(cellDiffs);
+    const qreal maxCellDiff = *std::max_element(cellDiffs.constBegin(), cellDiffs.constEnd());
+    int suspiciousCellCount = 0;
+    for (qreal cellDiff : cellDiffs) {
+        if (cellDiff >= 60.0
+            && cellDiff >= qMax<qreal>(medianCellDiff * 5.0, 50.0)) {
+            ++suspiciousCellCount;
+        }
+    }
+
+    return medianCellDiff <= 16.0
+        && maxCellDiff >= 65.0
+        && suspiciousCellCount >= 1
+        && suspiciousCellCount <= 10;
 }
 
 }
@@ -561,7 +324,7 @@ MainWindow::MainWindow(QWidget *parent)
     , m_ui(new Ui::MainWindow)
     , m_manager(new PeerManager(this))
     , m_mediaDevices(new QMediaDevices(this))
-    , m_videoSink(new QVideoSink(this))
+    , m_cameraThread(new OpenCvCameraThread(this))
     , m_videoRefreshTimer(new QTimer(this))
     , m_stateSaveTimer(new QTimer(this))
     , m_videoEncodeThread(new QThread(this))
@@ -612,9 +375,13 @@ MainWindow::MainWindow(QWidget *parent)
     connect(m_manager, &PeerManager::callInvitationReceived, this, &MainWindow::onCallInvitationReceived);
     connect(m_manager, &PeerManager::callAccepted, this, &MainWindow::onCallAccepted);
     connect(m_manager, &PeerManager::callEnded, this, &MainWindow::onCallEnded);
+    connect(m_manager, &PeerManager::remoteVideoSendingChanged, this, &MainWindow::onRemoteVideoSendingChanged);
     connect(m_manager, &PeerManager::remoteVideoFrameReceived, this, &MainWindow::onRemoteVideoFrameReceived);
     connect(m_manager, &PeerManager::remoteAudioChunkReceived, this, &MainWindow::onRemoteAudioChunkReceived);
-    connect(m_videoSink, &QVideoSink::videoFrameChanged, this, &MainWindow::processLocalFrame);
+    connect(m_cameraThread, &OpenCvCameraThread::frameCaptured, this, &MainWindow::processLocalFrame);
+    connect(m_cameraThread, &OpenCvCameraThread::cameraError, this, &MainWindow::onCameraErrorOccurred);
+    connect(m_cameraThread, &OpenCvCameraThread::cameraActiveChanged, this, &MainWindow::onCameraActiveChanged);
+    connect(m_cameraThread, &OpenCvCameraThread::captureFormatResolved, this, &MainWindow::onCameraCaptureFormatResolved);
     connect(m_videoRefreshTimer, &QTimer::timeout, this, &MainWindow::flushVideoFrames);
     connect(m_stateSaveTimer, &QTimer::timeout, this, [this]() {
         saveConversationState();
@@ -648,6 +415,10 @@ MainWindow::~MainWindow()
     if (m_stateSaveTimer->isActive()) {
         m_stateSaveTimer->stop();
     }
+    if (m_cameraThread) {
+        m_cameraThread->stopCapture();
+        m_cameraThread->wait();
+    }
     if (m_videoEncodeThread) {
         m_videoEncodeThread->quit();
         m_videoEncodeThread->wait();
@@ -667,9 +438,9 @@ void MainWindow::setupUi()
     m_ui->setupUi(this);
     m_ui->mainSplitter->setStretchFactor(1, 1);
     m_ui->conversationTitle->setStyleSheet(QStringLiteral("font-size: 18px; font-weight: 600;"));
-    m_ui->callStatusLabel->setStyleSheet(QStringLiteral("font-size: 14px; font-weight: 500; padding: 2px 0;"));
+    m_ui->callStatusLabel->setStyleSheet(QStringLiteral("font-size: 13px; font-weight: 500; padding: 0;"));
     if (m_ui->cameraFormatHintLabel) {
-        m_ui->cameraFormatHintLabel->setStyleSheet(QStringLiteral("color: #666;"));
+        m_ui->cameraFormatHintLabel->setStyleSheet(QStringLiteral("color: #666; font-size: 11px; padding-left: 4px;"));
     }
     m_ui->transcript->setWordWrapMode(QTextOption::WrapAtWordBoundaryOrAnywhere);
     m_ui->messageEdit->setWordWrapMode(QTextOption::WrapAtWordBoundaryOrAnywhere);
@@ -738,7 +509,7 @@ void MainWindow::applyCameraSelection()
     const QString formatText = !isUsableCameraFormat(format)
         ? QStringLiteral("自动推荐")
         : cameraFormatDisplayText(format);
-    if (m_camera) {
+    if (m_cameraThread && m_cameraThread->isRunning()) {
         stopCamera();
         if (!m_activeCallPeerId.isEmpty()) {
             ensureCameraRunning();
@@ -768,11 +539,33 @@ void MainWindow::applyReceiveRemoteVideoOnlySetting(bool enabled)
 
     if (enabled) {
         stopCamera();
+        clearLocalCallFrame();
+    } else if (!m_activeCallPeerId.isEmpty()) {
+        if (!prepareCallCamera()) {
+            if (m_ui->receiveRemoteVideoOnlyCheck) {
+                const QSignalBlocker blocker(m_ui->receiveRemoteVideoOnlyCheck);
+                m_ui->receiveRemoteVideoOnlyCheck->setChecked(true);
+            }
+            settings.setValue(QStringLiteral("receiveRemoteVideoOnly"), true);
+            updateCallStatusLabel();
+            showStatusMessage(QStringLiteral("恢复本地视频发送失败，已保持仅接收图像模式。"), 4000);
+            return;
+        }
     }
 
+    if (!m_activeCallPeerId.isEmpty()) {
+        m_manager->setVideoSendingEnabled(m_activeCallPeerId, !enabled);
+        appendHistoryLine(peerConversationKey(m_activeCallPeerId),
+                          QStringLiteral("[%1] %2")
+                              .arg(timestampLabel(QDateTime::currentDateTime()),
+                                   enabled ? QStringLiteral("我已暂停本地视频发送")
+                                           : QStringLiteral("我已恢复本地视频发送")));
+    }
+
+    updateCallStatusLabel();
     showStatusMessage(enabled
                           ? QStringLiteral("已开启仅接收图像模式，本地不会发送视频。")
-                          : QStringLiteral("已关闭仅接收图像模式。"),
+                          : QStringLiteral("已关闭仅接收图像模式，本地视频发送已恢复。"),
                       3000);
     refreshConversationView();
 }
@@ -912,20 +705,16 @@ void MainWindow::endVideoCall()
         return;
     }
 
-    m_manager->endCall(m_activeCallPeerId);
+    const QString peerId = m_activeCallPeerId;
+    m_manager->endCall(peerId);
     showStatusMessage(QStringLiteral("音视频通话已结束。"), 3000);
     m_activeCallPeerId.clear();
-    m_lastRemoteFrame = QImage();
-    m_lastLocalFrame = QImage();
-    m_pendingRemoteFrame = QImage();
-    m_pendingLocalFrame = QImage();
-    m_pendingVideoEncodeFrame = QImage();
-    m_pendingVideoPeerId.clear();
-    refreshVideoLabels();
-    if (m_ui->callStatusLabel) {
-        m_ui->callStatusLabel->setText(QStringLiteral("未在通话中"));
-    }
     stopCallMedia();
+    clearCallFrames();
+    updateCallStatusLabel();
+    appendHistoryLine(peerConversationKey(peerId),
+                      QStringLiteral("[%1] 通话已由我方结束")
+                          .arg(timestampLabel(QDateTime::currentDateTime())));
     updateActionState();
 }
 
@@ -943,17 +732,7 @@ void MainWindow::refreshConversationView()
         m_ui->conversationTitle->setText(QStringLiteral("未选择会话"));
     }
 
-    if (m_ui->callStatusLabel) {
-        if (!m_activeCallPeerId.isEmpty()) {
-            m_ui->callStatusLabel->setText(shouldSendLocalVideo()
-                                           ? QStringLiteral("正在与 %1 音视频通话").arg(peerName(m_activeCallPeerId))
-                                           : QStringLiteral("正在与 %1 通话（仅接收图像）").arg(peerName(m_activeCallPeerId)));
-        } else if (!currentPeerId().isEmpty()) {
-            m_ui->callStatusLabel->setText(QStringLiteral("当前通话目标: %1").arg(peerName(currentPeerId())));
-        } else {
-            m_ui->callStatusLabel->setText(QStringLiteral("请选择一个联系人发起音视频通话"));
-        }
-    }
+    updateCallStatusLabel();
 
     updateActionState();
 }
@@ -1064,14 +843,15 @@ void MainWindow::onCallInvitationReceived(const QString &peerId)
         if (m_ui->contentTabs) {
             m_ui->contentTabs->setCurrentIndex(1);
         }
-        if (m_ui->callStatusLabel) {
-            m_ui->callStatusLabel->setText(shouldSendLocalVideo()
-                                           ? QStringLiteral("正在与 %1 音视频通话").arg(peerName(peerId))
-                                           : QStringLiteral("正在与 %1 通话（仅接收图像）").arg(peerName(peerId)));
-        }
-        showStatusMessage(QStringLiteral("已接受 %1 的音视频请求。").arg(peerName(peerId)), 4000);
-        updateActionState();
+    if (m_ui->callStatusLabel) {
+        m_ui->callStatusLabel->setText(shouldSendLocalVideo()
+                                       ? QStringLiteral("正在与 %1 音视频通话").arg(peerName(peerId))
+                                       : QStringLiteral("正在与 %1 通话（仅接收图像）").arg(peerName(peerId)));
     }
+    m_manager->setVideoSendingEnabled(peerId, shouldSendLocalVideo());
+    showStatusMessage(QStringLiteral("已接受 %1 的音视频请求。").arg(peerName(peerId)), 4000);
+    updateActionState();
+}
 }
 
 void MainWindow::onCallAccepted(const QString &peerId)
@@ -1091,6 +871,7 @@ void MainWindow::onCallAccepted(const QString &peerId)
                                        ? QStringLiteral("正在与 %1 音视频通话").arg(peerName(peerId))
                                        : QStringLiteral("正在与 %1 通话（仅接收图像）").arg(peerName(peerId)));
     }
+    m_manager->setVideoSendingEnabled(peerId, shouldSendLocalVideo());
     showStatusMessage(QStringLiteral("%1 已接受音视频请求。").arg(peerName(peerId)), 4000);
     updateActionState();
 }
@@ -1103,30 +884,55 @@ void MainWindow::onCallEnded(const QString &peerId)
     }
 
     m_activeCallPeerId.clear();
-    m_lastRemoteFrame = QImage();
-    m_lastLocalFrame = QImage();
-    m_pendingRemoteFrame = QImage();
-    m_pendingLocalFrame = QImage();
-    m_pendingVideoEncodeFrame = QImage();
-    m_pendingVideoPeerId.clear();
-    refreshVideoLabels();
-    if (m_ui->callStatusLabel) {
-        m_ui->callStatusLabel->setText(QStringLiteral("未在通话中"));
-    }
     stopCallMedia();
+    clearCallFrames();
+    updateCallStatusLabel();
+    appendHistoryLine(peerConversationKey(peerId),
+                      QStringLiteral("[%1] %2 已结束音视频通话")
+                          .arg(timestampLabel(QDateTime::currentDateTime()), peerName(peerId)));
     showStatusMessage(QStringLiteral("%1 已结束音视频通话。").arg(peerName(peerId)), 4000);
+    QMessageBox::information(this,
+                             QStringLiteral("通话已结束"),
+                             QStringLiteral("%1 已结束音视频通话。").arg(peerName(peerId)));
     updateActionState();
+}
+
+void MainWindow::onRemoteVideoSendingChanged(const QString &peerId, bool enabled)
+{
+    if (m_activeCallPeerId != peerId) {
+        return;
+    }
+
+    if (!enabled) {
+        clearRemoteCallFrame();
+        if (m_ui->remoteVideoWidget) {
+            m_ui->remoteVideoWidget->setPlaceholderText(QStringLiteral("对方已暂停视频"));
+        }
+        appendHistoryLine(peerConversationKey(peerId),
+                          QStringLiteral("[%1] %2 已暂停视频发送")
+                              .arg(timestampLabel(QDateTime::currentDateTime()), peerName(peerId)));
+        showStatusMessage(QStringLiteral("%1 已暂停视频发送。").arg(peerName(peerId)), 4000);
+        QMessageBox::information(this,
+                                 QStringLiteral("视频状态变更"),
+                                 QStringLiteral("%1 已暂停视频发送。").arg(peerName(peerId)));
+        return;
+    }
+
+    if (m_ui->remoteVideoWidget) {
+        m_ui->remoteVideoWidget->setPlaceholderText(QStringLiteral("远端画面"));
+    }
+    appendHistoryLine(peerConversationKey(peerId),
+                      QStringLiteral("[%1] %2 已恢复视频发送")
+                          .arg(timestampLabel(QDateTime::currentDateTime()), peerName(peerId)));
+    showStatusMessage(QStringLiteral("%1 已恢复视频发送。").arg(peerName(peerId)), 4000);
 }
 
 void MainWindow::onRemoteVideoFrameReceived(const QString &peerId, const QImage &frame)
 {
-    if (m_activeCallPeerId.isEmpty()) {
-        m_activeCallPeerId = peerId;
-        if (m_ui->contentTabs) {
-            m_ui->contentTabs->setCurrentIndex(1);
-        }
-    }
     if (m_activeCallPeerId == peerId) {
+        if (m_ui->remoteVideoWidget) {
+            m_ui->remoteVideoWidget->setPlaceholderText(QStringLiteral("远端画面"));
+        }
         m_pendingRemoteFrame = frame;
     }
 }
@@ -1139,10 +945,6 @@ void MainWindow::onRemoteAudioChunkReceived(const QString &peerId,
 {
     if (audioData.isEmpty()) {
         return;
-    }
-
-    if (m_activeCallPeerId.isEmpty()) {
-        m_activeCallPeerId = peerId;
     }
 
     if (m_activeCallPeerId != peerId) {
@@ -1188,32 +990,35 @@ void MainWindow::onEncodedVideoFrame(const QString &peerId,
     emit encodeVideoFrameRequested(nextPeerId, nextFrame);
 }
 
-void MainWindow::processLocalFrame(const QVideoFrame &frame)
+void MainWindow::processLocalFrame(const QImage &frame)
 {
-    if (!frame.isValid()) {
+    if (frame.isNull() || !m_cameraActive || !shouldSendLocalVideo()) {
         return;
     }
 
-    const QImage referenceImage = !m_pendingLocalFrame.isNull() ? m_pendingLocalFrame : m_lastLocalFrame;
-    QImage displayImage = frameToDisplayImage(frame, referenceImage);
+    const QImage displayImage = frame.format() == QImage::Format_RGB32
+        ? frame
+        : frame.convertToFormat(QImage::Format_RGB32);
     if (displayImage.isNull()) {
         if (!m_frameWarningLimiter.isValid() || m_frameWarningLimiter.elapsed() >= 3000) {
-            qWarning().nospace()
-                << "Skipping local video frame: pixelFormat=" << frame.pixelFormat()
-                << ", size=" << frame.size();
             showStatusMessage(QStringLiteral("摄像头视频帧转换失败，已跳过异常帧。"), 3000);
             m_frameWarningLimiter.restart();
         }
         return;
     }
 
-    if (!referenceImage.isNull() && looksLikeBottomStripeCorruption(displayImage, referenceImage)) {
-        qWarning().nospace()
-            << "Filtered likely striped local frame: pixelFormat=" << frame.pixelFormat()
-            << ", size=" << frame.size();
-        displayImage = referenceImage;
+    const QImage referenceFrame = !m_pendingLocalFrame.isNull() ? m_pendingLocalFrame : m_lastLocalFrame;
+    if (m_filteredLocalFrameCount < 8 && looksLikeLocalFrameCorruption(displayImage, referenceFrame)) {
+        ++m_filteredLocalFrameCount;
+        if (!m_frameWarningLimiter.isValid() || m_frameWarningLimiter.elapsed() >= 3000) {
+            qWarning() << "Filtered likely corrupted local camera frame, count =" << m_filteredLocalFrameCount;
+            showStatusMessage(QStringLiteral("检测到摄像头异常帧，已自动过滤。"), 3000);
+            m_frameWarningLimiter.restart();
+        }
+        return;
     }
 
+    m_filteredLocalFrameCount = 0;
     m_pendingLocalFrame = displayImage;
 
     const bool shouldLog = !m_localFrameLogTimer.isValid() || m_localFrameLogTimer.elapsed() >= 3000;
@@ -1221,28 +1026,21 @@ void MainWindow::processLocalFrame(const QVideoFrame &frame)
         && shouldSendLocalVideo()
         && (!m_frameLimiter.isValid() || m_frameLimiter.elapsed() >= localVideoSendIntervalMs());
 
-    QImage transportImage;
-    if (shouldLog || shouldSend) {
-        transportImage = frameToTransportImage(frame, displayImage);
-    }
-
     if (shouldLog) {
         qInfo() << "Local video frame ready:"
-                << "pixelFormat =" << frame.pixelFormat()
-                << "frameSize =" << frame.size()
-                << "displayImageSize =" << displayImage.size()
-                << "transportImageSize =" << transportImage.size();
+                << "frameSize =" << displayImage.size()
+                << "imageFormat =" << displayImage.format();
         m_localFrameLogTimer.restart();
     }
 
     if (shouldSend) {
-        if (!transportImage.isNull()) {
+        if (!displayImage.isNull()) {
             if (!m_videoEncodeInFlight) {
                 m_videoEncodeInFlight = true;
-                emit encodeVideoFrameRequested(m_activeCallPeerId, transportImage);
+                emit encodeVideoFrameRequested(m_activeCallPeerId, displayImage);
             } else {
                 m_pendingVideoPeerId = m_activeCallPeerId;
-                m_pendingVideoEncodeFrame = transportImage;
+                m_pendingVideoEncodeFrame = displayImage;
             }
         }
         m_frameLimiter.restart();
@@ -1407,6 +1205,53 @@ void MainWindow::updateTranscriptView(const QString &conversationKey, bool force
     }
 }
 
+void MainWindow::clearCallFrames()
+{
+    clearRemoteCallFrame();
+    clearLocalCallFrame();
+    refreshVideoLabels();
+}
+
+void MainWindow::clearLocalCallFrame()
+{
+    m_lastLocalFrame = QImage();
+    m_pendingLocalFrame = QImage();
+    m_pendingVideoEncodeFrame = QImage();
+    m_pendingVideoPeerId.clear();
+    m_filteredLocalFrameCount = 0;
+    refreshVideoLabels();
+}
+
+void MainWindow::clearRemoteCallFrame()
+{
+    m_lastRemoteFrame = QImage();
+    m_pendingRemoteFrame = QImage();
+    if (m_ui->remoteVideoWidget) {
+        m_ui->remoteVideoWidget->setPlaceholderText(QStringLiteral("远端画面"));
+    }
+    refreshVideoLabels();
+}
+
+void MainWindow::updateCallStatusLabel()
+{
+    if (!m_ui->callStatusLabel) {
+        return;
+    }
+
+    if (!m_activeCallPeerId.isEmpty()) {
+        m_ui->callStatusLabel->setText(shouldSendLocalVideo()
+                                       ? QStringLiteral("正在与 %1 音视频通话").arg(peerName(m_activeCallPeerId))
+                                       : QStringLiteral("正在与 %1 通话（仅接收图像）").arg(peerName(m_activeCallPeerId)));
+        return;
+    }
+
+    if (!currentPeerId().isEmpty()) {
+        m_ui->callStatusLabel->setText(QStringLiteral("当前通话目标: %1").arg(peerName(currentPeerId())));
+    } else {
+        m_ui->callStatusLabel->setText(QStringLiteral("请选择一个联系人发起音视频通话"));
+    }
+}
+
 void MainWindow::populateCameraDevices()
 {
     if (!m_ui->cameraCombo) {
@@ -1510,6 +1355,16 @@ QString MainWindow::groupListLabel(const GroupInfo &group) const
         label.append(QStringLiteral("  (%1条未读)").arg(unreadCount));
     }
     return label;
+}
+
+QString MainWindow::selectedCameraDevicePath() const
+{
+    return cameraDevicePathFromId(m_ui->cameraCombo ? m_ui->cameraCombo->currentData().toByteArray() : QByteArray());
+}
+
+int MainWindow::selectedCameraDeviceIndex() const
+{
+    return m_ui->cameraCombo ? m_ui->cameraCombo->currentIndex() : -1;
 }
 
 QCameraDevice MainWindow::selectedCameraDevice() const
@@ -1676,9 +1531,16 @@ void MainWindow::updateCameraFormatHint()
         return;
     }
 
+#ifndef LANLINKCHAT_HAS_OPENCV
+    m_ui->cameraFormatHintLabel->setText(QStringLiteral("当前构建未启用 OpenCV 采集，请安装 libopencv-dev 后重新编译。"));
+    m_ui->cameraFormatHintLabel->setToolTip(m_ui->cameraFormatHintLabel->text());
+    return;
+#endif
+
     const QCameraDevice device = selectedCameraDevice();
     if (device.isNull()) {
         m_ui->cameraFormatHintLabel->setText(QStringLiteral("当前未检测到摄像头，无法选择分辨率。"));
+        m_ui->cameraFormatHintLabel->setToolTip(m_ui->cameraFormatHintLabel->text());
         return;
     }
 
@@ -1688,25 +1550,51 @@ void MainWindow::updateCameraFormatHint()
         prefix = QStringLiteral("当前选择");
     }
 
-    if (m_camera && m_camera->isActive()) {
+    if (m_cameraActive) {
         prefix = QStringLiteral("当前生效");
-        format = m_camera->cameraFormat();
     }
 
-    if (!isUsableCameraFormat(format)) {
-        m_ui->cameraFormatHintLabel->setText(QStringLiteral("%1：该设备未返回可用视频格式。").arg(prefix));
+    if (m_cameraActive && m_activeCameraResolution.isValid()) {
+        QString detail = QStringLiteral("%1 %2x%3")
+                             .arg(prefix,
+                                  QString::number(m_activeCameraResolution.width()),
+                                  QString::number(m_activeCameraResolution.height()));
+        if (m_activeCameraFrameRate > 0.0) {
+            detail.append(QStringLiteral(" @%1fps")
+                              .arg(QString::number(m_activeCameraFrameRate,
+                                                   'f',
+                                                   m_activeCameraFrameRate < 10.0 ? 1 : 0)));
+        }
+        m_ui->cameraFormatHintLabel->setText(detail);
+        QString tooltip = detail;
+        if (!m_cameraBackendName.isEmpty()) {
+            tooltip.append(QStringLiteral("\n采集后端：%1").arg(m_cameraBackendName));
+        }
+        m_ui->cameraFormatHintLabel->setToolTip(tooltip);
         return;
     }
 
-    m_ui->cameraFormatHintLabel->setText(QStringLiteral("%1：%2，共检测到 %3 种格式。")
-                                             .arg(prefix,
-                                                  cameraFormatDisplayText(format),
-                                                  QString::number(device.videoFormats().size())));
+    if (!isUsableCameraFormat(format)) {
+        m_ui->cameraFormatHintLabel->setText(QStringLiteral("%1 无可用格式").arg(prefix));
+        m_ui->cameraFormatHintLabel->setToolTip(QStringLiteral("%1：该设备未返回可用视频格式。").arg(prefix));
+        return;
+    }
+
+    const QString formatText = cameraFormatDisplayText(format);
+    m_ui->cameraFormatHintLabel->setText(QStringLiteral("%1 %2").arg(prefix, formatText));
+    m_ui->cameraFormatHintLabel->setToolTip(QStringLiteral("%1：%2，共检测到 %3 种格式。")
+                                                .arg(prefix,
+                                                     formatText,
+                                                     QString::number(device.videoFormats().size())));
 }
 
 bool MainWindow::ensureCameraRunning()
 {
-    if (m_camera) {
+#ifndef LANLINKCHAT_HAS_OPENCV
+    reportCameraIssue(QStringLiteral("当前构建未启用 OpenCV 采集，请安装 libopencv-dev 后重新编译。"), true);
+    return false;
+#else
+    if (m_cameraThread && m_cameraThread->isRunning()) {
         return true;
     }
 
@@ -1715,9 +1603,6 @@ bool MainWindow::ensureCameraRunning()
         return false;
     }
 
-    m_camera = new QCamera(cameraDevice, this);
-    connect(m_camera, &QCamera::errorOccurred, this, &MainWindow::onCameraErrorOccurred);
-    connect(m_camera, &QCamera::activeChanged, this, &MainWindow::onCameraActiveChanged);
     if (!cameraDevice.videoFormats().isEmpty()) {
         qInfo() << "Available camera formats for" << cameraDevice.description() << ":";
         for (const QCameraFormat &candidate : cameraDevice.videoFormats()) {
@@ -1728,35 +1613,47 @@ bool MainWindow::ensureCameraRunning()
                 << ", minFrameRate=" << candidate.minFrameRate()
                 << ", maxFrameRate=" << candidate.maxFrameRate();
         }
-
-        const QCameraFormat requestedFormat = selectedCameraFormat(cameraDevice);
-        if (isUsableCameraFormat(requestedFormat)) {
-            m_camera->setCameraFormat(requestedFormat);
-            qInfo().nospace()
-                << "Requested camera format for " << cameraDevice.description()
-                << ": " << requestedFormat.resolution().width() << "x" << requestedFormat.resolution().height()
-                << ", pixelFormat=" << requestedFormat.pixelFormat()
-                << ", maxFrameRate=" << requestedFormat.maxFrameRate();
-        }
     }
 
-    m_captureSession.setCamera(m_camera);
-    m_captureSession.setVideoSink(m_videoSink);
-    m_camera->start();
+    const QCameraFormat requestedFormat = selectedCameraFormat(cameraDevice);
+    const QSize requestedResolution = isUsableCameraFormat(requestedFormat)
+        ? requestedFormat.resolution()
+        : QSize(640, 360);
+    const double requestedFrameRate = isUsableCameraFormat(requestedFormat) && requestedFormat.maxFrameRate() > 0.0
+        ? requestedFormat.maxFrameRate()
+        : 30.0;
+    const QString devicePath = selectedCameraDevicePath();
+    const int deviceIndex = selectedCameraDeviceIndex();
 
-    if (m_camera->error() != QCamera::NoError) {
-        reportCameraIssue(QStringLiteral("摄像头启动失败：%1").arg(m_camera->errorString()), true);
+    qInfo().nospace()
+        << "Requested OpenCV camera for " << cameraDevice.description()
+        << ": path=" << devicePath
+        << ", index=" << deviceIndex
+        << ", resolution=" << requestedResolution.width() << "x" << requestedResolution.height()
+        << ", maxFrameRate=" << requestedFrameRate;
+
+    m_cameraActive = false;
+    m_activeCameraResolution = QSize();
+    m_activeCameraFrameRate = 0.0;
+    m_cameraBackendName.clear();
+    m_cameraThread->configure(devicePath,
+                              deviceIndex,
+                              cameraDevice.description(),
+                              requestedResolution,
+                              requestedFrameRate);
+    m_cameraThread->start();
+    if (!m_cameraThread->wait(1) && m_cameraThread->isRunning()) {
+        updateCameraFormatHint();
+        return true;
+    }
+
+    if (!m_cameraThread->isRunning() && !m_cameraActive) {
         return false;
     }
 
-    const QCameraFormat activeFormat = m_camera->cameraFormat();
-    qInfo().nospace()
-        << "Active camera format for " << cameraDevice.description()
-        << ": " << activeFormat.resolution().width() << "x" << activeFormat.resolution().height()
-        << ", pixelFormat=" << activeFormat.pixelFormat()
-        << ", maxFrameRate=" << activeFormat.maxFrameRate();
     updateCameraFormatHint();
     return true;
+#endif
 }
 
 bool MainWindow::prepareCallCamera()
@@ -1902,14 +1799,19 @@ void MainWindow::stopCallMedia()
 
 void MainWindow::stopCamera()
 {
-    if (!m_camera) {
+    if (!m_cameraThread) {
         updateCameraFormatHint();
         return;
     }
 
-    m_camera->stop();
-    m_camera->deleteLater();
-    m_camera = nullptr;
+    m_cameraThread->stopCapture();
+    if (m_cameraThread->isRunning()) {
+        m_cameraThread->wait();
+    }
+    m_cameraActive = false;
+    m_activeCameraResolution = QSize();
+    m_activeCameraFrameRate = 0.0;
+    m_cameraBackendName.clear();
     m_lastLocalFrame = QImage();
     m_pendingLocalFrame = QImage();
     m_pendingVideoEncodeFrame = QImage();
@@ -2007,26 +1909,30 @@ void MainWindow::onAudioOutputsChanged()
     showStatusMessage(QStringLiteral("扬声器设备列表已更新。"), 3000);
 }
 
-void MainWindow::onCameraErrorOccurred()
+void MainWindow::onCameraErrorOccurred(const QString &message)
 {
-    if (!m_camera) {
-        return;
-    }
-
-    reportCameraIssue(QStringLiteral("摄像头错误：%1").arg(m_camera->errorString()), true);
+    reportCameraIssue(message, true);
 }
 
 void MainWindow::onCameraActiveChanged(bool active)
 {
+    m_cameraActive = active;
     if (active) {
-        showStatusMessage(QStringLiteral("摄像头已启动。"), 2000);
+        showStatusMessage(QStringLiteral("OpenCV 摄像头已启动。"), 2000);
         updateCameraFormatHint();
         return;
     }
 
-    if (m_camera && m_camera->error() == QCamera::NoError && shouldSendLocalVideo() && !m_activeCallPeerId.isEmpty()) {
-        reportCameraIssue(QStringLiteral("摄像头已停止工作，本地视频发送已中断。"), false);
-    }
+    updateCameraFormatHint();
+}
+
+void MainWindow::onCameraCaptureFormatResolved(const QSize &resolution,
+                                               double frameRate,
+                                               const QString &backendName)
+{
+    m_activeCameraResolution = resolution;
+    m_activeCameraFrameRate = frameRate;
+    m_cameraBackendName = backendName;
     updateCameraFormatHint();
 }
 

@@ -354,6 +354,16 @@ void PeerManager::endCall(const QString &peerId)
     }
 }
 
+void PeerManager::setVideoSendingEnabled(const QString &peerId, bool enabled)
+{
+    if (PeerConnection *connection = ensureConnection(peerId)) {
+        QJsonObject meta;
+        meta.insert(QStringLiteral("fromId"), m_localPeerId);
+        meta.insert(QStringLiteral("enabled"), enabled);
+        connection->sendPacket(QStringLiteral("call_video_state"), meta);
+    }
+}
+
 void PeerManager::sendVideoFrame(const QString &peerId, const QImage &frame)
 {
     if (frame.isNull()) {
@@ -551,6 +561,11 @@ void PeerManager::onPacketReceived(PeerConnection *connection, const QString &ty
 
     if (type == QLatin1String("call_end")) {
         emit callEnded(peerId);
+        return;
+    }
+
+    if (type == QLatin1String("call_video_state")) {
+        emit remoteVideoSendingChanged(peerId, meta.value(QStringLiteral("enabled")).toBool(true));
         return;
     }
 
