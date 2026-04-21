@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <QBuffer>
+#include <QCryptographicHash>
 #include <QCoreApplication>
 #include <QDateTime>
 #include <QDebug>
@@ -13,7 +14,9 @@
 #include <QJsonArray>
 #include <QJsonObject>
 #include <QPainter>
+#include <QSettings>
 #include <QStandardPaths>
+#include <QLockFile>
 #include <QTcpServer>
 #include <QTcpSocket>
 #include <QThread>
@@ -136,7 +139,7 @@ QImage normalizeFrameForTransport(const QImage &frame, const QSize &targetSize)
 
 PeerManager::PeerManager(QObject *parent)
     : QObject(parent)
-    , m_localPeerId(newId())
+    , m_localPeerId()
     , m_displayName(QHostInfo::localHostName().isEmpty() ? QStringLiteral("QtUser") : QHostInfo::localHostName())
     , m_discovery(new DiscoveryService(this))
     , m_server(new QTcpServer(this))
@@ -146,7 +149,32 @@ PeerManager::PeerManager(QObject *parent)
 {
     m_videoLogTimer.start();
 
-    m_server->listen(QHostAddress::AnyIPv4, 0);
+    QSettings settings;
+    m_settingsScope = acquireInstanceScope(settings);
+    const QString configuredPeerId = settings.value(QStringLiteral("%1/localPeerId").arg(m_settingsScope)).toString().trimmed();
+    m_localPeerId = configuredPeerId.isEmpty() ? newId() : configuredPeerId;
+    settings.setValue(QStringLiteral("%1/localPeerId").arg(m_settingsScope), m_localPeerId);
+
+    const QString configuredDownloadDirectory = settings.value(QStringLiteral("downloadDirectory")).toString().trimmed();
+    m_downloadDirectory = configuredDownloadDirectory.isEmpty() ? appDataDownloadPath() : configuredDownloadDirectory;
+    const QStringList removedPeers = settings.value(QStringLiteral("%1/removedPeerIds").arg(m_settingsScope)).toStringList();
+    m_removedPeerIds = QSet<QString>(removedPeers.begin(), removedPeers.end());
+
+    const quint16 configuredListenPort = static_cast<quint16>(settings.value(QStringLiteral("%1/localListenPort").arg(m_settingsScope), 0).toUInt());
+    bool listening = false;
+    if (configuredListenPort != 0) {
+        listening = m_server->listen(QHostAddress::AnyIPv4, configuredListenPort);
+    }
+    if (!listening) {
+        listening = m_server->listen(QHostAddress::AnyIPv4, 0);
+    }
+    if (!listening) {
+        qWarning() << "LanLinkChat failed to listen on any TCP port:" << m_server->errorString();
+    }
+    settings.setValue(QStringLiteral("%1/localListenPort").arg(m_settingsScope), static_cast<int>(m_server->serverPort()));
+    qInfo() << "LanLinkChat local peer =" << m_localPeerId
+            << "scope =" << m_settingsScope
+            << "tcpPort =" << m_server->serverPort();
 
     m_discovery->setLocalPeer(m_localPeerId, m_displayName, m_server->serverPort());
     m_discovery->start();
@@ -166,6 +194,8 @@ PeerManager::PeerManager(QObject *parent)
 
 PeerManager::~PeerManager()
 {
+    delete m_instanceLock;
+    m_instanceLock = nullptr;
     if (m_videoDecodeThread) {
         m_videoDecodeThread->quit();
         m_videoDecodeThread->wait();
@@ -203,6 +233,46 @@ void PeerManager::refreshDiscovery()
 {
     m_discovery->announceNow();
     emit noticeRaised(QStringLiteral("已发送手动发现广播，正在刷新局域网节点。"));
+}
+
+void PeerManager::setDownloadDirectory(const QString &directoryPath)
+{
+    const QString normalizedPath = QDir::cleanPath(directoryPath.trimmed().isEmpty() ? appDataDownloadPath() : directoryPath.trimmed());
+    if (m_downloadDirectory == normalizedPath) {
+        return;
+    }
+
+    m_downloadDirectory = normalizedPath;
+    QSettings settings;
+    settings.setValue(QStringLiteral("downloadDirectory"), m_downloadDirectory);
+}
+
+QString PeerManager::downloadDirectory() const
+{
+    return QDir::cleanPath(m_downloadDirectory.trimmed().isEmpty() ? appDataDownloadPath() : m_downloadDirectory);
+}
+
+bool PeerManager::removePeer(const QString &peerId)
+{
+    if (peerId.isEmpty() || !m_peers.contains(peerId)) {
+        return false;
+    }
+
+    m_removedPeerIds.insert(peerId);
+    saveRemovedPeers();
+
+    if (PeerConnection *connection = m_connectionsByPeerId.take(peerId)) {
+        m_peerIdsByConnection.remove(connection);
+        if (connection->socket()) {
+            connection->socket()->disconnectFromHost();
+        }
+    }
+
+    m_sentVideoFrames.remove(peerId);
+    m_receivedVideoFrames.remove(peerId);
+    m_peers.remove(peerId);
+    emitPeersChanged();
+    return true;
 }
 
 bool PeerManager::sendDirectMessage(const QString &peerId, const QString &text)
@@ -457,6 +527,10 @@ void PeerManager::sendAudioChunk(const QString &peerId, const QByteArray &audioD
 
 void PeerManager::onPeerAnnounced(const PeerInfo &peer)
 {
+    if (m_removedPeerIds.contains(peer.id)) {
+        return;
+    }
+
     PeerInfo current = m_peers.value(peer.id);
     current.id = peer.id;
     current.name = peer.name;
@@ -786,6 +860,12 @@ void PeerManager::handleHello(PeerConnection *connection, const QJsonObject &met
     if (peerId.isEmpty() || peerId == m_localPeerId) {
         return;
     }
+    if (m_removedPeerIds.contains(peerId)) {
+        if (connection && connection->socket()) {
+            connection->socket()->disconnectFromHost();
+        }
+        return;
+    }
     registerConnection(connection, peerId, peerName);
 }
 
@@ -796,7 +876,7 @@ void PeerManager::handleIncomingFileBegin(const QJsonObject &meta)
         return;
     }
 
-    QDir().mkpath(appDataDownloadPath());
+    QDir().mkpath(downloadDirectory());
     const QString fileName = meta.value(QStringLiteral("fileName")).toString();
     const QString savePath = availableDownloadPath(fileName);
     auto *file = new QFile(savePath, this);
@@ -859,7 +939,7 @@ void PeerManager::handleIncomingFileEnd(const QJsonObject &meta)
 
 QString PeerManager::availableDownloadPath(const QString &fileName) const
 {
-    return uniqueFilePath(appDataDownloadPath(), fileName);
+    return uniqueFilePath(downloadDirectory(), fileName);
 }
 
 QString PeerManager::peerDisplayName(const QString &peerId) const
@@ -872,6 +952,54 @@ QString PeerManager::peerDisplayName(const QString &peerId) const
 
 QString PeerManager::appDataDownloadPath() const
 {
-    const QString base = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
-    return QDir(base).filePath(QStringLiteral("downloads"));
+    const QString downloadBase = QStandardPaths::writableLocation(QStandardPaths::DownloadLocation);
+    if (!downloadBase.trimmed().isEmpty()) {
+        return QDir(downloadBase).filePath(QStringLiteral("LanLinkChat"));
+    }
+
+    const QString appDataBase = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+    return QDir(appDataBase).filePath(QStringLiteral("downloads"));
+}
+
+void PeerManager::saveRemovedPeers() const
+{
+    QSettings settings;
+    settings.setValue(QStringLiteral("%1/removedPeerIds").arg(settingsScope()),
+                      QStringList(m_removedPeerIds.begin(), m_removedPeerIds.end()));
+}
+
+QString PeerManager::acquireInstanceScope(QSettings &settings)
+{
+    const QString baseScope = settingsScope();
+    const QString lockDirectory = QStandardPaths::writableLocation(QStandardPaths::TempLocation);
+    QDir().mkpath(lockDirectory);
+
+    for (int index = 0; index < 16; ++index) {
+        const QString scope = index == 0
+            ? baseScope
+            : QStringLiteral("%1_%2").arg(baseScope).arg(index + 1);
+        auto *lockFile = new QLockFile(QDir(lockDirectory).filePath(QStringLiteral("LanLinkChat_%1.lock").arg(scope)));
+        lockFile->setStaleLockTime(0);
+        if (lockFile->tryLock(0)) {
+            delete m_instanceLock;
+            m_instanceLock = lockFile;
+            return scope;
+        }
+        delete lockFile;
+    }
+
+    const QString scope = QStringLiteral("%1_%2").arg(baseScope, newId());
+    settings.setValue(QStringLiteral("%1/temporaryInstance"), true);
+    return scope;
+}
+
+QString PeerManager::settingsScope() const
+{
+    if (!m_settingsScope.isEmpty()) {
+        return m_settingsScope;
+    }
+
+    const QString appPath = QDir::cleanPath(QCoreApplication::applicationDirPath()).toLower();
+    const QByteArray digest = QCryptographicHash::hash(appPath.toUtf8(), QCryptographicHash::Sha1).toHex();
+    return QStringLiteral("instances/%1").arg(QString::fromLatin1(digest.left(12)));
 }

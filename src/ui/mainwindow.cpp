@@ -13,6 +13,10 @@
 #include <QDebug>
 #include <QDialog>
 #include <QDialogButtonBox>
+#include <QDir>
+#include <QDragEnterEvent>
+#include <QDropEvent>
+#include <QEvent>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QInputDialog>
@@ -20,8 +24,10 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QListWidgetItem>
+#include <QMenu>
 #include <QMediaDevices>
 #include <QMessageBox>
+#include <QMimeData>
 #include <QIODevice>
 #include <QKeySequence>
 #include <QScrollBar>
@@ -33,6 +39,7 @@
 #include <QRegularExpression>
 #include <QThread>
 #include <QTimer>
+#include <QUrl>
 #include <QVideoFrameFormat>
 
 #include <algorithm>
@@ -427,6 +434,74 @@ MainWindow::~MainWindow()
     delete m_ui;
 }
 
+bool MainWindow::eventFilter(QObject *watched, QEvent *event)
+{
+    const bool handlesDragDrop = watched == m_ui->chatPage
+        || watched == m_ui->messagePanel
+        || watched == m_ui->messageEdit
+        || watched == m_ui->transcript
+        || watched == m_ui->messageEdit->viewport()
+        || watched == m_ui->transcript->viewport();
+    if (!handlesDragDrop) {
+        return QMainWindow::eventFilter(watched, event);
+    }
+
+    auto extractLocalFilePaths = [](const QMimeData *mimeData) {
+        QStringList filePaths;
+        if (!mimeData || !mimeData->hasUrls()) {
+            return filePaths;
+        }
+
+        for (const QUrl &url : mimeData->urls()) {
+            const QString path = url.toLocalFile();
+            if (path.isEmpty()) {
+                continue;
+            }
+
+            const QFileInfo info(path);
+            if (info.exists() && info.isFile()) {
+                filePaths.append(info.absoluteFilePath());
+            }
+        }
+        filePaths.removeDuplicates();
+        return filePaths;
+    };
+
+    switch (event->type()) {
+    case QEvent::DragEnter:
+    case QEvent::DragMove: {
+        auto *dragEvent = static_cast<QDropEvent *>(event);
+        if (!extractLocalFilePaths(dragEvent->mimeData()).isEmpty()) {
+            dragEvent->acceptProposedAction();
+            return true;
+        }
+        break;
+    }
+    case QEvent::Drop: {
+        auto *dropEvent = static_cast<QDropEvent *>(event);
+        const QStringList filePaths = extractLocalFilePaths(dropEvent->mimeData());
+        if (filePaths.isEmpty()) {
+            break;
+        }
+
+        dropEvent->acceptProposedAction();
+        if (currentPeerId().isEmpty()) {
+            showStatusMessage(QStringLiteral("请先在联系人页选择一个联系人，再拖拽发送文件。"), 4000);
+            return true;
+        }
+
+        if (sendFilesToPeer(filePaths)) {
+            showStatusMessage(QStringLiteral("已加入 %1 个文件发送任务。").arg(filePaths.size()), 4000);
+        }
+        return true;
+    }
+    default:
+        break;
+    }
+
+    return QMainWindow::eventFilter(watched, event);
+}
+
 void MainWindow::resizeEvent(QResizeEvent *event)
 {
     QMainWindow::resizeEvent(event);
@@ -451,6 +526,24 @@ void MainWindow::setupUi()
     m_ui->chatVerticalSplitter->setSizes({560, 160});
     m_ui->localVideoWidget->setPlaceholderText(QStringLiteral("本地画面"));
     m_ui->remoteVideoWidget->setPlaceholderText(QStringLiteral("远端画面"));
+    m_ui->chatPage->setAcceptDrops(true);
+    m_ui->messagePanel->setAcceptDrops(true);
+    m_ui->messageEdit->setAcceptDrops(true);
+    m_ui->transcript->setAcceptDrops(true);
+    m_ui->messageEdit->viewport()->setAcceptDrops(true);
+    m_ui->transcript->viewport()->setAcceptDrops(true);
+    m_ui->chatPage->installEventFilter(this);
+    m_ui->messagePanel->installEventFilter(this);
+    m_ui->messageEdit->installEventFilter(this);
+    m_ui->transcript->installEventFilter(this);
+    m_ui->messageEdit->viewport()->installEventFilter(this);
+    m_ui->transcript->viewport()->installEventFilter(this);
+    m_ui->peerList->setContextMenuPolicy(Qt::CustomContextMenu);
+    if (m_ui->downloadDirButton) {
+        const QString downloadDirectory = m_manager->downloadDirectory();
+        m_ui->downloadDirButton->setToolTip(QStringLiteral("当前接收文件保存到：%1")
+                                                .arg(QDir::toNativeSeparators(downloadDirectory)));
+    }
 }
 
 void MainWindow::connectUi()
@@ -459,6 +552,7 @@ void MainWindow::connectUi()
     connect(m_ui->refreshPeersButton, &QPushButton::clicked, this, &MainWindow::triggerPeerDiscovery);
     connect(m_ui->sendButton, &QPushButton::clicked, this, &MainWindow::sendTextMessage);
     connect(m_ui->fileButton, &QPushButton::clicked, this, &MainWindow::sendFileToPeer);
+    connect(m_ui->downloadDirButton, &QPushButton::clicked, this, &MainWindow::selectDownloadDirectory);
     connect(m_ui->groupButton, &QPushButton::clicked, this, &MainWindow::createGroup);
     connect(m_ui->cameraCombo, qOverload<int>(&QComboBox::currentIndexChanged), this, [this](int) {
         populateCameraFormats();
@@ -473,6 +567,7 @@ void MainWindow::connectUi()
     connect(m_ui->videoButton, &QPushButton::clicked, this, &MainWindow::startVideoCall);
     connect(m_ui->hangupButton, &QPushButton::clicked, this, &MainWindow::endVideoCall);
     connect(m_ui->peerList, &QListWidget::currentItemChanged, this, &MainWindow::refreshConversationView);
+    connect(m_ui->peerList, &QListWidget::customContextMenuRequested, this, &MainWindow::showPeerContextMenu);
     connect(m_ui->groupList, &QListWidget::currentItemChanged, this, &MainWindow::refreshConversationView);
     connect(m_ui->sidebarTabs, &QTabWidget::currentChanged, this, &MainWindow::refreshConversationView);
 
@@ -614,12 +709,73 @@ void MainWindow::sendFileToPeer()
         return;
     }
 
-    if (m_manager->sendFile(peerId, path)) {
-        appendHistoryLine(peerConversationKey(peerId),
-                          QStringLiteral("[%1] 我发送了文件: %2")
-                              .arg(timestampLabel(QDateTime::currentDateTime()),
-                                   QFileInfo(path).fileName()));
+    sendFilesToPeer({path});
+}
+
+void MainWindow::selectDownloadDirectory()
+{
+    const QString currentDirectory = m_manager->downloadDirectory();
+    const QString selectedDirectory = QFileDialog::getExistingDirectory(this,
+                                                                        QStringLiteral("选择接收文件保存位置"),
+                                                                        currentDirectory);
+    if (selectedDirectory.isEmpty()) {
+        return;
+    }
+
+    QDir().mkpath(selectedDirectory);
+    m_manager->setDownloadDirectory(selectedDirectory);
+    if (m_ui->downloadDirButton) {
+        m_ui->downloadDirButton->setToolTip(QStringLiteral("当前接收文件保存到：%1")
+                                                .arg(QDir::toNativeSeparators(selectedDirectory)));
+    }
+    showStatusMessage(QStringLiteral("文件保存位置已更新为：%1")
+                          .arg(QDir::toNativeSeparators(selectedDirectory)),
+                      4000);
+}
+
+void MainWindow::showPeerContextMenu(const QPoint &position)
+{
+    QListWidgetItem *item = m_ui->peerList ? m_ui->peerList->itemAt(position) : nullptr;
+    if (!item) {
+        return;
+    }
+
+    if (m_ui->peerList->currentItem() != item) {
+        m_ui->peerList->setCurrentItem(item);
+    }
+
+    QMenu menu(this);
+    QAction *removeAction = menu.addAction(QStringLiteral("删除联系人"));
+    const QAction *selectedAction = menu.exec(m_ui->peerList->viewport()->mapToGlobal(position));
+    if (selectedAction == removeAction) {
+        removeSelectedPeer();
+    }
+}
+
+void MainWindow::removeSelectedPeer()
+{
+    const QString peerId = currentPeerId();
+    if (peerId.isEmpty()) {
+        return;
+    }
+
+    const QString name = peerName(peerId);
+    const auto result = QMessageBox::question(this,
+                                              QStringLiteral("删除联系人"),
+                                              QStringLiteral("确认删除联系人“%1”？\n删除后将从本地联系人列表中隐藏。").arg(name));
+    if (result != QMessageBox::Yes) {
+        return;
+    }
+
+    if (m_activeCallPeerId == peerId) {
+        endVideoCall();
+    }
+
+    m_history.remove(peerConversationKey(peerId));
+    m_unreadCounts.remove(peerConversationKey(peerId));
+    if (m_manager->removePeer(peerId)) {
         refreshConversationView();
+        showStatusMessage(QStringLiteral("已删除联系人：%1").arg(name), 4000);
     }
 }
 
@@ -810,7 +966,10 @@ void MainWindow::onFileReceived(const QString &peerId, const QString &fileName, 
     const QString conversationKey = peerConversationKey(peerId);
     appendHistoryLine(conversationKey,
                       QStringLiteral("[%1] %2 发送了文件: %3\n已保存到: %4")
-                          .arg(timestampLabel(QDateTime::currentDateTime()), peerName(peerId), fileName, savedPath));
+                          .arg(timestampLabel(QDateTime::currentDateTime()),
+                               peerName(peerId),
+                               fileName,
+                               QDir::toNativeSeparators(savedPath)));
     updateUnreadCount(conversationKey);
     refreshConversationView();
     showStatusMessage(QStringLiteral("收到文件 %1").arg(fileName), 5000);
@@ -1177,6 +1336,43 @@ void MainWindow::scheduleConversationStateSave()
     }
 
     m_stateSaveTimer->start();
+}
+
+bool MainWindow::sendFilesToPeer(const QStringList &filePaths)
+{
+    const QString peerId = currentPeerId();
+    if (peerId.isEmpty()) {
+        return false;
+    }
+
+    int successCount = 0;
+    QStringList failedFiles;
+    const QString now = timestampLabel(QDateTime::currentDateTime());
+    for (const QString &path : filePaths) {
+        const QFileInfo info(path);
+        if (!info.exists() || !info.isFile()) {
+            failedFiles.append(info.fileName().isEmpty() ? path : info.fileName());
+            continue;
+        }
+
+        if (m_manager->sendFile(peerId, info.absoluteFilePath())) {
+            ++successCount;
+            appendHistoryLine(peerConversationKey(peerId),
+                              QStringLiteral("[%1] 我发送了文件: %2").arg(now, info.fileName()));
+        } else {
+            failedFiles.append(info.fileName());
+        }
+    }
+
+    if (successCount > 0) {
+        refreshConversationView();
+    }
+
+    if (!failedFiles.isEmpty()) {
+        showStatusMessage(QStringLiteral("以下文件发送失败：%1").arg(failedFiles.join(QStringLiteral("、"))), 5000);
+    }
+
+    return successCount > 0;
 }
 
 void MainWindow::updateTranscriptView(const QString &conversationKey, bool forceFullRefresh)

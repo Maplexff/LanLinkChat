@@ -140,6 +140,13 @@
                    </widget>
                   </item>
                   <item>
+                   <widget class="QPushButton" name="downloadDirButton">
+                    <property name="text">
+                     <string>保存位置</string>
+                    </property>
+                   </widget>
+                  </item>
+                  <item>
                    <spacer name="messageActionSpacer">
                     <property name="orientation">
                      <enum>Qt::Orientation::Horizontal</enum>

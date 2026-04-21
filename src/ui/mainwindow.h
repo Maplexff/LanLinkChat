@@ -3,6 +3,7 @@
 #include <QDateTime>
 #include <QAudioFormat>
 #include <QElapsedTimer>
+#include <QEvent>
 #include <QHash>
 #include <QImage>
 #include <QMainWindow>
@@ -43,6 +44,7 @@ public:
 
 protected:
     void resizeEvent(QResizeEvent *event) override;
+    bool eventFilter(QObject *watched, QEvent *event) override;
 
 signals:
     void encodeVideoFrameRequested(const QString &peerId, const QImage &frame);
@@ -55,6 +57,9 @@ private slots:
     void triggerPeerDiscovery();
     void sendTextMessage();
     void sendFileToPeer();
+    void selectDownloadDirectory();
+    void showPeerContextMenu(const QPoint &position);
+    void removeSelectedPeer();
     void createGroup();
     void startVideoCall();
     void endVideoCall();
@@ -98,6 +103,7 @@ private:
     void saveConversationState() const;
     void scheduleConversationStateSave();
     void updateTranscriptView(const QString &conversationKey, bool forceFullRefresh = false);
+    bool sendFilesToPeer(const QStringList &filePaths);
     void clearCallFrames();
     void clearLocalCallFrame();
     void clearRemoteCallFrame();

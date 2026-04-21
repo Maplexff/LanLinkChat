@@ -6,6 +6,7 @@
 #include <QImage>
 #include <QPointer>
 #include <QElapsedTimer>
+#include <QSet>
 
 #include "model/chattypes.h"
 #include "model/peerinfo.h"
@@ -13,10 +14,12 @@
 class DiscoveryService;
 class PeerConnection;
 class QFile;
+class QSettings;
 class QTcpServer;
 class QTcpSocket;
 class QTimer;
 class QThread;
+class QLockFile;
 class VideoDecodeWorker;
 
 class PeerManager : public QObject
@@ -38,6 +41,9 @@ public:
     GroupInfo createGroup(const QString &name, const QStringList &memberIds);
     void sendGroupMessage(const QString &groupId, const QString &text);
     bool sendFile(const QString &peerId, const QString &filePath);
+    void setDownloadDirectory(const QString &directoryPath);
+    QString downloadDirectory() const;
+    bool removePeer(const QString &peerId);
     void inviteToCall(const QString &peerId);
     void acceptCall(const QString &peerId);
     void endCall(const QString &peerId);
@@ -110,9 +116,15 @@ private:
     QString peerDisplayName(const QString &peerId) const;
     QString appDataDownloadPath() const;
     QString availableDownloadPath(const QString &fileName) const;
+    void saveRemovedPeers() const;
+    QString acquireInstanceScope(QSettings &settings);
+    QString settingsScope() const;
 
     QString m_localPeerId;
     QString m_displayName;
+    QString m_settingsScope;
+    QString m_downloadDirectory;
+    QLockFile *m_instanceLock = nullptr;
     DiscoveryService *m_discovery = nullptr;
     QTcpServer *m_server = nullptr;
     QTimer *m_pruneTimer = nullptr;
@@ -125,6 +137,7 @@ private:
     QHash<QString, IncomingFile> m_incomingFiles;
     QHash<QString, quint64> m_sentVideoFrames;
     QHash<QString, quint64> m_receivedVideoFrames;
+    QSet<QString> m_removedPeerIds;
     QElapsedTimer m_videoLogTimer;
     bool m_videoDecodeInFlight = false;
     PendingVideoDecode m_pendingVideoDecode;
