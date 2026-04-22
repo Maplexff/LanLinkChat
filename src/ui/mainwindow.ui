@@ -176,7 +176,7 @@
           </widget>
           <widget class="QWidget" name="callPage">
            <attribute name="title">
-            <string>音视频</string>
+            <string>通话</string>
            </attribute>
            <layout class="QVBoxLayout" name="callLayout">
             <property name="spacing">
