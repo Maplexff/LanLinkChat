@@ -1,0 +1,65 @@
+# Qt Creator
+*.pro.user
+*.pro.user.*
+*.qbs.user
+*.qbs.user.*
+*.creator
+*.creator.user
+*.creator.user.*
+*.files
+*.includes
+*.config
+.qtcreator/
+
+# CMake
+build/
+build-*/
+CMakeCache.txt
+CMakeCache.txt.prev
+CMakeFiles/
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+CTestTestfile.cmake
+Testing/
+
+# qmake
+.qmake.stash
+Makefile*
+moc_*.cpp
+moc_*.h
+qrc_*.cpp
+ui_*.h
+*.moc
+*.o
+*.obj
+*.lo
+*.a
+*.la
+*.prl
+
+# Binaries and libs
+*.so
+*.so.*
+*.dll
+*.dylib
+*.exe
+*.out
+*.app
+
+# Common build outputs
+bin/
+lib/
+debug/
+release/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+
+*.codex
+*.run
